@@ -281,7 +281,11 @@ class ClientManager:
 
         # ВАЖНО: StringSession НЕ хранит api_id/api_hash — они всегда
         # берутся из настроек/переменных окружения (см. get_api_credentials).
-        api_id, api_hash = await self.get_api_credentials()
+        # Исключение: аккаунты, импортированные из TData — для них при
+        # импорте сохраняются служебные настройки tg_api_id_acc_<id>,
+        # соответствующие api-парам того самого tdata (auth-ключ сессии
+        # жёстко привязан к api_id, чужие ключи не подойдут).
+        api_id, api_hash = await self._get_account_credentials(account_id)
 
         proxy_cfg: Optional[dict[str, Any]] = None
         if account.proxy_id is not None:
@@ -788,35 +792,60 @@ class ClientManager:
         :raises ClientManagerError: Если opentele не установлен, путь неверен
                                     или конвертация/подключение не удалось.
         """
-        # 1. Зависимость opentele (тяжёлый импорт — только по требованию)
+        # 1. Зависимости opentele (тяжёлые импорты — только по требованию).
+        # ВАЖНО: модуля opentele.tdata НЕ существует ни в одной версии
+        # opentele (это была ошибка предыдущей сборки кода — из-за неё импорт
+        # падал, корутина завершалась исключением, а GUI мог оставаться на
+        # стадии «идёт конвертация»). Публичный API пакета:
+        #   opentele.td.TDesktop      — чтение папки tdata;
+        #   opentele.tl.TelegramClient — обёртка над Telethon + StringSession.
         try:
-            from opentele.tdata import TDataSession  # type: ignore
+            from opentele.td import TDesktop  # type: ignore
+            from opentele.tl import TelegramClient as OTelegramClient  # type: ignore
+            from telethon.sessions import StringSession as _SS  # noqa: F401
         except ImportError as exc:
             raise ClientManagerError(
                 "Для импорта TData необходим пакет opentele.\n\n"
                 "Установите его командой:\n"
                 "    pip install opentele\n\n"
-                "или через меню приложения, если установка доступна."
+                "Проверить установку: python -c \"from opentele.td import TDesktop\""
             ) from exc
 
-        # 2. Валидация пути
+        # 2. Валидация пути. opentele читает КОРНЕВУЮ папку tdata клиента
+        # (в ней лежат файлы key_data / data), а не подпапку аккаунта.
         abs_path = os.path.abspath((tdata_path or "").strip().strip('"'))
         if not os.path.isdir(abs_path):
             raise ClientManagerError(
                 f"Папка не найдена: {abs_path}\n\n"
-                "Нужно указать путь к папке tdata КОНКРЕТНОГО аккаунта, "
-                "например:\n"
-                "C:\\Users\\ВашНик\\AppData\\Roaming\\AyuGramDesktop\\tdata\\Work"
+                "Нужно указать КОРНЕВУЮ папку tdata, например:\n"
+                "C:\\Users\\ВашНик\\AppData\\Roaming\\AyuGramDesktop\\tdata"
             )
-        if not any(
-            os.path.exists(os.path.join(abs_path, f))
-            for f in ("key_datas", "map", "settings")
-        ):
-            raise ClientManagerError(
-                f"В папке {abs_path} нет файлов сессии Telegram "
-                "(key_datas / map).\n\nУкажите путь к подпапке аккаунта "
-                "внутри tdata (например ...\\tdata\\Work)."
+
+        def _has_key_file(path: str) -> bool:
+            """Есть ли в папке файлы ключей tdata (key_data / key_datas / data)."""
+            try:
+                entries = os.listdir(path)
+            except OSError:
+                return False
+            names = [e.lower() for e in entries]
+            return any(
+                n.startswith("key_data") or n == "data" or n.startswith("key_")
+                for n in names
             )
+
+        if not _has_key_file(abs_path):
+            # Возможно указан AppData-папка клиента — попробуем <base>/tdata
+            alt = os.path.join(abs_path, "tdata")
+            if os.path.isdir(alt) and _has_key_file(alt):
+                abs_path = alt
+            elif os.path.isfile(os.path.join(abs_path, "key_datas")):
+                pass  # старый формат layout — попробуем прочитать как есть
+            else:
+                raise ClientManagerError(
+                    f"В папке {abs_path} нет файлов ключей Telegram Desktop "
+                    "(key_data / data).\n\nУкажите корневую папку tdata "
+                    "(...\\AyuGramDesktop\\tdata), а не подпапку аккаунта."
+                )
 
         def _status(text: str) -> None:
             """Безопасный вызов колбэка статуса."""
@@ -826,44 +855,299 @@ class ClientManager:
                 except Exception as cb_exc:  # noqa: BLE001
                     logger.warning(f"Ошибка колбэка статуса TData: {cb_exc}")
 
-        # 3. Конвертация TData -> StringSession (CPU-задача, в отдельном потоке)
+        # 3. Чтение tdata и получение auth-ключа (CPU-задача, вне Qt-потока).
         _status("tdata_convert")
         try:
-            td_kwargs: dict[str, Any] = {"folder": abs_path}
-            if password:
-                td_kwargs["password"] = password
-            tdata_session = await asyncio.to_thread(TDataSession, **td_kwargs)
-            session_string: str = await asyncio.to_thread(
-                lambda: str(tdata_session.migrate_to_string())
+            load_result = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self._load_tdata_account, TDesktop, abs_path, password or None
+                ),
+                timeout=90.0,
             )
-        except ValueError as exc:
-            # opentele бросает ValueError при неверном пароле tdata
-            if "password" in str(exc).lower():
-                raise ClientManagerError(
-                    "Неверный пароль локального шифрования tdata. "
-                    "Задайте его в поле «Пароль tdata» или оставьте пустым, "
-                    "если пароль не устанавливался."
-                ) from exc
-            logger.error(f"Ошибка конвертации TData: {exc}")
-            raise ClientManagerError(f"Не удалось прочитать TData: {exc}") from exc
-        except Exception as exc:  # noqa: BLE001
-            logger.error(f"Ошибка конвертации TData из {abs_path}: {exc}")
+        except asyncio.TimeoutError as exc:
             raise ClientManagerError(
-                f"Ошибка конвертации TData: {exc}\n\n"
-                "Совет: полностью закройте десктопный Telegram/AyuGram и "
-                "повторите попытку (файлы tdata могут быть заняты)."
+                "Чтение папки tdata заняло слишком много времени (>90 сек).\n\n"
+                "Закройте AyuGram/Telegram Desktop (файлы могут быть заняты) "
+                "и повторите попытку."
             ) from exc
+        except ClientManagerError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(f"Неожиданная ошибка чтения TData из {abs_path}")
+            raise ClientManagerError(self._format_tdata_error(exc, bool(password))) from exc
 
-        if not session_string:
-            raise ClientManagerError("Конвертация не вернула строковую сессию.")
+        user_id: int = load_result["user_id"]
+        dc_id: int = load_result["dc_id"]
+        auth_key: bytes = load_result["auth_key"]
+        api_id: int = load_result["api_id"]
+        api_hash: str = load_result["api_hash"]
+        accounts_count: int = load_result["accounts_count"]
 
         _status("tdata_converted")
 
-        # 4. Проверка сессии и сохранение аккаунта в БД
-        account = await self.add_account_by_session(
-            session_string, proxy_id=proxy_id, on_status=on_status
+        # 4. Сборка StringSession из auth-ключа (тот же алгоритм, что и у
+        # opentele migrate_to_string): заголовок 0x5B + ip:port + DC id +
+        # 192-байтовый auth_key.
+        try:
+            endpoint = load_result["endpoint"]
+            header = b"\x5b"
+            addr_bytes = f"{endpoint[0]}:{endpoint[1]}".encode("ascii")
+            raw = (
+                header
+                + len(addr_bytes).to_bytes(1, "little")
+                + addr_bytes
+                + int(dc_id).to_bytes(4, "little")
+                + auth_key[:192]
+            )
+            session_string = _SS.encode(raw).decode("ascii")
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"Ошибка сборки строковой сессии из TData: {exc}")
+            raise ClientManagerError(
+                f"Не удалось собрать сессию из прочитанных данных: {exc}"
+            ) from exc
+
+        # 5. Сохранение аккаунта в БД (сессия шифруется мастер-ключом).
+        # api_id/api_hash аккаунта сохраняются в записи — они понадобятся
+        # для подключения (Telethon сверяет ключ сессии с api_id).
+        encrypted_session = self.encryption.encrypt(session_string)
+        account = Account(
+            phone=None,
+            username=None,
+            session_data=encrypted_session,
+            proxy_id=proxy_id,
+            status="active",
+            last_used=None,
         )
+        account_id = await self.db.create_account(account)
+        account.id = account_id
+
+        # Служебные настройки: id аккаунта -> api credentials этого tdata
+        try:
+            await self.db.update_setting(
+                f"tg_api_id_acc_{account_id}", str(api_id)
+            )
+            await self.db.update_setting(
+                f"tg_api_hash_acc_{account_id}", api_hash
+            )
+        except Exception as set_exc:  # noqa: BLE001
+            logger.warning(f"Не удалось сохранить API-пары аккаунта: {set_exc}")
+
+        logger.info(
+            f"Аккаунт импортирован из TData: id={account_id}, "
+            f"user_id={user_id}, dc={dc_id}, всего аккаунтов в tdata: {accounts_count}"
+        )
+
+        # 6. Опциональная проверка сессии подключением к Telegram.
+        # Не обязательна: даже если сеть недоступна, аккаунт уже сохранён.
+        _status("connecting")
+        verify_warning: Optional[str] = None
+        try:
+            me = await self._verify_session_official(
+                session_string, api_id, api_hash, proxy_id=proxy_id
+            )
+            username = getattr(me, "username", None)
+            phone = getattr(me, "phone", None)
+            if username or phone:
+                account.username = username
+                account.phone = phone
+                await self.db.update_account(account)
+        except ClientManagerError as exc:
+            verify_warning = str(exc)
+            logger.warning(
+                f"TData импортирован, но проверка сессии не выполнена: {exc}"
+            )
+        _status("done")
+
+        if verify_warning:
+            # Прикрепляем предупреждение к объекту для отображения в GUI
+            account.session_data = account.session_data  # без изменений
+            setattr(account, "_verify_warning", verify_warning)
         return account
+
+    # ------------------------------------------------------------------
+    # Вспомогательные методы импорта TData
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _load_tdata_account(
+        TDesktop_cls: Any,
+        base_path: str,
+        password: Optional[str],
+    ) -> dict[str, Any]:
+        """
+        Чтение корневой папки tdata и извлечение данных авторизации.
+
+        Выполняется в отдельном потоке (синхронный CPU/disk код opentele).
+
+        :param TDesktop_cls: Класс opentele.td.TDesktop.
+        :param base_path: Корневая папка tdata.
+        :param password: Локальный пароль tdata (passcode), если задан.
+        :return: Словарь с полями: user_id, dc_id, auth_key (bytes),
+                 api_id, api_hash, endpoint (ip, port), accounts_count.
+        """
+        tdesk = TDesktop_cls(base_path, passcode=password)
+        if not tdesk.isLoaded():
+            raise RuntimeError("TDesktop не загрузил данные из папки tdata")
+
+        accounts = list(tdesk.accounts)
+        if not accounts:
+            raise RuntimeError("В папке tdata не найдено ни одного аккаунта")
+
+        account = tdesk.mainAccount or accounts[0]
+        auth_key_obj = account.authKey
+        if auth_key_obj is None:
+            raise RuntimeError(
+                "Аккаунт в tdata не авторизован (пустой auth_key). "
+                "Откройте AyuGram и убедитесь, что аккаунт активен."
+            )
+
+        # Endpoint ДЦ из конфигурации, сохранённой в tdata
+        from opentele.td import MTP  # type: ignore
+
+        endpoints = account._local.config.endpoints(account.MainDcId)
+        ipv4_tcp = endpoints[MTP.DcOptions.Address.IPv4][MTP.DcOptions.Protocol.Tcp]
+        if not ipv4_tcp:
+            raise RuntimeError(
+                "В конфиге tdata не найдено IPv4 TCP-эндпоинтов для ДЦ "
+                f"{int(account.MainDcId)}"
+            )
+        endpoint = ipv4_tcp[0]
+
+        api_data = account.api
+        return {
+            "user_id": int(account.UserId),
+            "dc_id": int(account.MainDcId),
+            "auth_key": bytes(auth_key_obj.key)[:192],
+            "api_id": int(getattr(api_data, "api_id", 0)),
+            "api_hash": str(getattr(api_data, "api_hash", "") or ""),
+            "endpoint": (str(endpoint.ip), int(endpoint.port)),
+            "accounts_count": len(accounts),
+        }
+
+    @staticmethod
+    def _format_tdata_error(exc: Exception, had_password: bool) -> str:
+        """
+        Преобразование ошибок opentele при чтении tdata в понятный текст.
+
+        :param exc: Исключение, возникшее при загрузке TDesktop.
+        :param had_password: Был ли передан пароль tdata.
+        :return: Человекочитаемое сообщение (рус.).
+        """
+        text = str(exc)
+        lower = text.lower()
+        if "decrypt" in lower or "passcode" in lower or "bad" in lower and "key" in lower:
+            if had_password:
+                return (
+                    "Неверный локальный пароль tdata. Введите правильный пароль "
+                    "в поле «Пароль tdata»."
+                )
+            return (
+                "Папка tdata защищена локальным паролем (Local Passcode в "
+                "AyuGram/Telegram Desktop). Введите его в поле «Пароль tdata»."
+            )
+        if "not loaded" in lower or "no account" in lower or "zero" in lower:
+            return (
+                f"Не удалось прочитать аккаунты из tdata: {text}\n\n"
+                "Убедитесь, что указана КОРНЕВАЯ папка tdata "
+                "(...\\AyuGramDesktop\\tdata) и что AyuGram полностью закрыт."
+            )
+        return (
+            f"Ошибка чтения TData: {text}\n\n"
+            "Советы:\n"
+            "1) Полностью закройте AyuGram/Telegram Desktop (правый клик в трее "
+            "→ Выход) — файлы tdata могут быть заняты;\n"
+            "2) Указывайте корневую папку tdata, а не подпапку аккаунта;\n"
+            "3) Если в клиенте задан Local Passcode — введите его в диалоге."
+        )
+
+    async def _verify_session_official(
+        self,
+        session_string: str,
+        api_id: int,
+        api_hash: str,
+        proxy_id: Optional[int] = None,
+    ) -> Any:
+        """
+        Проверка собранной строковой сессии подключением к Telegram.
+
+        Использует api_id/api_hash, извлечённые из того же tdata (ключ сессии
+        жёстко привязан к api_id, поэтому сторонние ключи не подойдут).
+
+        :return: Объект me (User) из client.get_me().
+        :raises ClientManagerError: При сетевых ошибках/невалидной сессии.
+        """
+        proxy_cfg = (
+            await self.build_proxy_config(int(proxy_id))
+            if proxy_id is not None
+            else None
+        )
+
+        async def _get_me(client: TelegramClient) -> Any:
+            """Запрос данных пользователя."""
+            me = await client.get_me()
+            if me is None:
+                raise ClientManagerError(
+                    "Сессия не авторизована: Telegram не вернул данные "
+                    "пользователя."
+                )
+            return me
+
+        try:
+            return await self._run_temp_client_with_api(
+                StringSession(session_string),
+                proxy_cfg,
+                _get_me,
+                api_id=api_id,
+                api_hash=api_hash,
+                connect_timeout=25.0,
+                request_timeout=25.0,
+            )
+        except ClientManagerError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"Ошибка проверки TData-сессии: {exc}")
+            raise ClientManagerError(format_telethon_error(exc)) from exc
+
+    async def _run_temp_client_with_api(
+        self,
+        session: "StringSession",
+        proxy_cfg: Optional[dict[str, Any]],
+        action: Callable[[TelegramClient], Coroutine[Any, Any, Any]],
+        api_id: int,
+        api_hash: str,
+        connect_timeout: float = 25.0,
+        request_timeout: float = 35.0,
+    ) -> Any:
+        """
+        То же, что _run_temp_client, но с ЯВНЫМИ api_id/api_hash
+        (для сессий, импортированных из чужого tdata).
+        """
+        client: Optional[TelegramClient] = None
+        try:
+            client = TelegramClient(
+                session,
+                api_id,
+                api_hash,
+                proxy=proxy_cfg,
+                connection=ConnectionTcpFull,
+                request_retries=1,
+                connection_retries=1,
+                auto_reconnect=False,
+            )
+            await asyncio.wait_for(client.connect(), timeout=connect_timeout)
+            return await asyncio.wait_for(action(client), timeout=request_timeout)
+        except asyncio.TimeoutError as exc:
+            raise ClientManagerError(
+                "Нет соединения с серверами Telegram (таймаут) — аккаунт "
+                "сохранён в базе, но проверить сессию не удалось. Попробуйте "
+                "кнопку «Проверить» во вкладке Аккаунты позже или используйте "
+                "прокси."
+            ) from exc
+        finally:
+            if client is not None:
+                try:
+                    await asyncio.wait_for(client.disconnect(), timeout=10.0)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(f"Ошибка отключения временного клиента: {exc}")
 
     # ------------------------------------------------------------------
     # Проверка работоспособности аккаунта (используется вкладкой Аккаунты)
