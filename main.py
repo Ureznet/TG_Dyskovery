@@ -11,19 +11,152 @@
 """
 
 import asyncio
+import os
 import sys
 import threading
 from concurrent.futures import Future
 from typing import Any, Callable, Coroutine, Optional
 
 from loguru import logger
-from PySide6.QtCore import QObject, QTimer, Signal, Slot
-from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import QObject, QTimer, Signal
+from PySide6.QtWidgets import (
+    QApplication,
+    QDialog,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMessageBox,
+    QPushButton,
+    QVBoxLayout,
+)
 
 from database.db import DatabaseManager
 from database.settings import SettingsManager
 from gui.main_window import MainWindow
+from telegram_client.client_manager import ClientManager
+from utils.encryption import EncryptionManager
 from utils.logger import setup_logger
+
+# Путь к файлу мастер-ключа
+MASTER_KEY_PATH = "data/master.key"
+
+
+class MasterPasswordDialog(QDialog):
+    """Диалог ввода мастер-пароля для шифрования сессий аккаунтов."""
+
+    def __init__(self, title: str, confirm: bool = False,
+                 error_text: str = "") -> None:
+        """
+        :param title: Заголовок диалога.
+        :param confirm: Требовать повторный ввод пароля (первый запуск).
+        :param error_text: Текст ошибки для повторного запроса.
+        """
+        super().__init__()
+        self.setWindowTitle("Telegram Discovery — Мастер-пароль")
+        self.setModal(True)
+        self.setMinimumWidth(380)
+
+        layout = QVBoxLayout(self)
+        hint = QLabel(title)
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        if error_text:
+            err = QLabel(error_text)
+            err.setStyleSheet("color: #cc0000;")
+            err.setWordWrap(True)
+            layout.addWidget(err)
+
+        self.edit = QLineEdit()
+        self.edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.edit.setPlaceholderText("Мастер-пароль")
+        layout.addWidget(self.edit)
+
+        self.edit_confirm: Optional[QLineEdit] = None
+        if confirm:
+            self.edit_confirm = QLineEdit()
+            self.edit_confirm.setEchoMode(QLineEdit.EchoMode.Password)
+            self.edit_confirm.setPlaceholderText("Повторите пароль")
+            layout.addWidget(self.edit_confirm)
+
+        buttons = QHBoxLayout()
+        btn_ok = QPushButton("OK")
+        btn_cancel = QPushButton("Отмена")
+        buttons.addStretch(1)
+        buttons.addWidget(btn_ok)
+        buttons.addWidget(btn_cancel)
+        layout.addLayout(buttons)
+
+        btn_ok.clicked.connect(self._on_accept)
+        btn_cancel.clicked.connect(self.reject)
+
+    def _on_accept(self) -> None:
+        """Проверка заполнения и совпадения паролей."""
+        if not self.edit.text():
+            return
+        if self.edit_confirm is not None and \
+                self.edit.text() != self.edit_confirm.text():
+            QMessageBox.warning(self, "Несовпадение", "Пароли не совпадают.")
+            return
+        self.accept()
+
+    def password(self) -> str:
+        """Введённый мастер-пароль."""
+        return self.edit.text()
+
+
+def ensure_encryption() -> Optional[EncryptionManager]:
+    """
+    Инициализация менеджера шифрования.
+
+    При первом запуске (нет data/master.key) запрашивает новый мастер-пароль
+    и сохраняет ключ. При последующих запусках запрашивает пароль и проверяет
+    его по сохранённому ключу.
+
+    :return: Готовый EncryptionManager либо None, если пользователь отказался.
+    """
+    first_run = not os.path.exists(MASTER_KEY_PATH)
+
+    while True:
+        dialog = MasterPasswordDialog(
+            title=(
+                "Первый запуск: придумайте мастер-пароль для шифрования "
+                "сессий Telegram. ЗАПОМИНАНИЕ ОБЯЗАТЕЛЬНО — без него данные "
+                "не восстановить."
+                if first_run else
+                "Введите мастер-пароль для разблокировки хранилища сессий."
+            ),
+            confirm=first_run,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            logger.warning("Пользователь отменил ввод мастер-пароля")
+            return None
+
+        password = dialog.password()
+        if first_run:
+            encryption = EncryptionManager(password)
+            try:
+                encryption.save_master_key(MASTER_KEY_PATH)
+            except Exception as exc:  # noqa: BLE001
+                logger.error(f"Ошибка сохранения мастер-ключа: {exc}")
+                QMessageBox.critical(None, "Ошибка", f"Не удалось сохранить ключ: {exc}")
+                return None
+            logger.info("Создан новый мастер-ключ")
+            return encryption
+
+        # Не первый запуск: проверка пароля по файлу ключа
+        encryption = EncryptionManager(password)  # временный вывод ключа
+        if encryption.load_master_key(MASTER_KEY_PATH, password):
+            return encryption
+
+        reply = QMessageBox.question(
+            None, "Неверный пароль",
+            "Мастер-пароль неверен. Попробовать ещё раз?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return None
 
 
 class AsyncBridge(QObject):
@@ -157,6 +290,12 @@ def main() -> int:
     app.setApplicationName("Telegram Discovery")
     app.setApplicationVersion("2.0")
 
+    # Инициализация шифрования (мастер-пароль при первом запуске)
+    encryption = ensure_encryption()
+    if encryption is None:
+        logger.warning("Шифрование не инициализировано — выход из приложения")
+        return 1
+
     # Фоновый asyncio loop с инициализацией БД
     bridge = AsyncBridge()
     bridge.initialized.connect(
@@ -172,8 +311,15 @@ def main() -> int:
     if not bridge.wait_started(timeout=10.0):
         logger.error("Не удалось запустить фоновый asyncio-поток")
         return 1
+    if bridge.db is None:
+        logger.error("База данных не инициализирована")
+        return 1
 
-    window = MainWindow(bridge.db)
+    # Менеджер Telethon-клиентов
+    client_manager = ClientManager(bridge.db, encryption)
+    logger.info("ClientManager инициализирован")
+
+    window = MainWindow(bridge.db, client_manager)
     window.show()
     logger.info("Главное окно отображено")
 

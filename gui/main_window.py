@@ -9,8 +9,8 @@
 - сигналы для интеграции с фоновыми asyncio-задачами.
 """
 
-import html
 from datetime import datetime
+from typing import Optional
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor, QFont, QTextCharFormat, QTextCursor
@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QMainWindow,
     QPushButton,
+    QSizePolicy,
     QSplitter,
     QTabWidget,
     QTextEdit,
@@ -29,6 +30,8 @@ from PySide6.QtWidgets import (
 )
 
 from database.db import DatabaseManager
+from gui.accounts_window import AccountsWindow
+from telegram_client.client_manager import ClientManager
 
 # Цвета уровней в панели логов
 _LEVEL_COLORS: dict[str, str] = {
@@ -46,12 +49,16 @@ class MainWindow(QMainWindow):
     task_completed = Signal(int)               # (task_id)
     log_received = Signal(str, str)            # (level, message)
 
-    def __init__(self, db: DatabaseManager) -> None:
+    def __init__(
+        self, db: DatabaseManager, client_manager: Optional[ClientManager] = None
+    ) -> None:
         """
         :param db: Инициализированный менеджер базы данных.
+        :param client_manager: Менеджер Telethon-клиентов (для вкладки «Аккаунты»).
         """
         super().__init__()
         self.db: DatabaseManager = db
+        self.client_manager: Optional[ClientManager] = client_manager
 
         # Счётчики для индикатора статуса
         self._active_tasks_count: int = 0
@@ -94,7 +101,7 @@ class MainWindow(QMainWindow):
         # Прижимаем индикатор к правому краю панели
         spacer = QWidget()
         spacer.setSizePolicy(
-            spacer.sizePolicy().Expanding, spacer.sizePolicy().Preferred
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
         )
         toolbar.addWidget(spacer)
         toolbar.addWidget(self.status_indicator)
@@ -122,8 +129,19 @@ class MainWindow(QMainWindow):
             "Dashboard", "Выберите задачу или создайте новую"), "Dashboard")
         self.tabs.addTab(self._create_placeholder_tab(
             "Checker", "Введите список каналов для проверки"), "Чекер")
-        self.tabs.addTab(self._create_placeholder_tab(
-            "Accounts", "Управление аккаунтами Telegram"), "Аккаунты")
+
+        # Вкладка «Аккаунты» — полноценный экран управления (Шаг 2)
+        if self.client_manager is not None:
+            self.accounts_tab = AccountsWindow(self.db, self.client_manager)
+            self.accounts_tab.accounts_changed.connect(self._on_accounts_changed)
+        else:
+            # Резервный вариант без менеджера клиентов (не должно случаться)
+            self.accounts_tab = None
+            self.tabs.addTab(self._create_placeholder_tab(
+                "Accounts", "Управление аккаунтами Telegram"), "Аккаунты")
+        if self.accounts_tab is not None:
+            self.tabs.addTab(self.accounts_tab, "Аккаунты")
+
         self.tabs.addTab(self._create_placeholder_tab(
             "Settings", "Глобальные настройки приложения"), "Настройки")
         splitter.addWidget(self.tabs)
@@ -224,6 +242,10 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # Индикатор статуса
     # ------------------------------------------------------------------
+    def _on_accounts_changed(self, active_accounts: int) -> None:
+        """Слот: вкладка «Аккаунты» сообщила об изменении числа активных аккаунтов."""
+        self.update_status_indicator(self._active_tasks_count, active_accounts)
+
     def update_status_indicator(self, active_tasks: int, active_accounts: int) -> None:
         """
         Обновление текста индикатора на верхней панели.

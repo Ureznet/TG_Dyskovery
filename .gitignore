@@ -1,4 +1,3 @@
-__pycache__/
-*.pyc
-logs/
-*.log
+*.db
+*.db-shm
+*.db-wal

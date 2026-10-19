@@ -1,0 +1,471 @@
+# -*- coding: utf-8 -*-
+"""
+Менеджер Telethon-клиентов приложения Telegram Discovery.
+
+Отвечает за:
+- создание подключённых клиентов из сохранённых (зашифрованных) сессий;
+- добавление нового аккаунта по схеме: номер телефона -> код -> 2FA;
+- шифрование строковой сессии Telethon перед сохранением в БД;
+- формирование конфигурации прокси (socks5 / http, включая MTProto)
+  через python-socks.
+
+ВАЖНО: все методы асинхронные и должны вызываться внутри asyncio event loop
+(в приложении — фоновый loop AsyncBridge), чтобы не блокировать GUI.
+"""
+
+import os
+import re
+from typing import Any, Optional
+
+from loguru import logger
+from telethon import TelegramClient
+from telethon.errors import (
+    ApiIdInvalidError,
+    AuthKeyDuplicatedError,
+    BadRequestError,
+    FloodWaitError,
+    PhoneCodeExpiredError,
+    PhoneCodeInvalidError,
+    PhoneNumberBannedError,
+    PhoneNumberInvalidError,
+    SessionPasswordNeededError,
+)
+from telethon.sessions import StringSession
+
+from database.db import DatabaseManager
+from database.models import Account
+from utils.encryption import EncryptionManager
+
+# Ключи настроек БД для API-параметров Telegram
+KEY_TG_API_ID = "tg_api_id"
+KEY_TG_API_HASH = "tg_api_hash"
+
+# Строгое сравнение телефонных номеров (сигнатура Telethon)
+_PHONE_RE = re.compile(r"^\+?[0-9]{5,16}$")
+
+
+class ClientManagerError(Exception):
+    """Базовое исключение менеджера клиентов."""
+
+
+class MissingApiCredentialsError(ClientManagerError):
+    """Не заданы api_id / api_hash."""
+
+
+def format_telethon_error(exc: Exception) -> str:
+    """
+    Преобразование исключения Telethon в человекочитаемое сообщение (рус.).
+
+    :param exc: Исключение, возникшее при работе с Telegram.
+    :return: Текст ошибки для отображения в GUI.
+    """
+    if isinstance(exc, PhoneCodeInvalidError):
+        return "Неверный код подтверждения. Проверьте код из SMS и попробуйте снова."
+    if isinstance(exc, PhoneCodeExpiredError):
+        return "Срок действия кода истёк. Нажмите «Отправить код» ещё раз."
+    if isinstance(exc, PhoneNumberInvalidError):
+        return "Неверный формат номера телефона. Используйте международный формат, например +79991234567."
+    if isinstance(exc, PhoneNumberBannedError):
+        return "Этот номер заблокирован Telegram."
+    if isinstance(exc, FloodWaitError):
+        return f"Слишком много попыток. Повторите через {int(getattr(exc, 'seconds', 0))} сек."
+    if isinstance(exc, (ApiIdInvalidError, AuthKeyDuplicatedError)):
+        return "Неверные api_id / api_hash или конфликт сессии. Проверьте настройки Telegram API."
+    if isinstance(exc, BadRequestError):
+        return f"Telegram отклонил запрос: {exc}"
+    return f"Ошибка Telegram: {exc}"
+
+
+class ClientManager:
+    """Менеджер создания клиентов Telethon и управления аккаунтами."""
+
+    def __init__(self, db: DatabaseManager, encryption: EncryptionManager) -> None:
+        """
+        :param db: Инициализированный менеджер базы данных.
+        :param encryption: Менеджер шифрования (мастер-ключ уже загружен).
+        """
+        self.db: DatabaseManager = db
+        self.encryption: EncryptionManager = encryption
+
+    # ------------------------------------------------------------------
+    # Параметры API (TG_API_ID / TG_API_HASH)
+    # ------------------------------------------------------------------
+    async def get_api_credentials(self) -> tuple[int, str]:
+        """
+        Получение api_id / api_hash: сначала переменные окружения,
+        затем глобальные настройки из таблицы settings (tg_api_id/tg_api_hash).
+
+        :return: Кортеж (api_id, api_hash).
+        :raises MissingApiCredentialsError: Если параметры нигде не заданы.
+        """
+        api_id_raw: Optional[str] = os.environ.get("TG_API_ID") or None
+        api_hash: Optional[str] = os.environ.get("TG_API_HASH") or None
+
+        if not api_id_raw or not api_hash:
+            try:
+                db_id = await self.db.get_setting(KEY_TG_API_ID)
+                db_hash = await self.db.get_setting(KEY_TG_API_HASH)
+            except Exception as exc:  # noqa: BLE001
+                logger.error(f"Ошибка чтения API-настроек из БД: {exc}")
+                raise ClientManagerError(
+                    "Не удалось прочитать настройки tg_api_id / tg_api_hash из БД"
+                ) from exc
+            api_id_raw = api_id_raw or (db_id or None)
+            api_hash = api_hash or (db_hash or None)
+
+        if not api_id_raw or not api_hash:
+            raise MissingApiCredentialsError(
+                "Не заданы параметры Telegram API.\n\n"
+                "Получите их на https://my.telegram.org/apps и задайте любым способом:\n"
+                "1) Переменные окружения TG_API_ID и TG_API_HASH;\n"
+                "2) Настройки приложения: ключи tg_api_id и tg_api_hash."
+            )
+
+        try:
+            api_id = int(str(api_id_raw).strip())
+        except ValueError as exc:
+            raise MissingApiCredentialsError(
+                f"Некорректное значение api_id: «{api_id_raw}». Ожидается целое число."
+            ) from exc
+
+        return api_id, str(api_hash).strip()
+
+    # ------------------------------------------------------------------
+    # Прокси
+    # ------------------------------------------------------------------
+    async def build_proxy_config(self, proxy_id: int) -> Optional[dict[str, Any]]:
+        """
+        Формирование конфига прокси для TelegramClient по записи из таблицы proxies.
+
+        Поддерживаются типы: socks5, socks4, http, mtproxy (MTProto).
+        Логин/пароль хранятся в БД в зашифрованном виде и расшифровываются здесь.
+
+        :param proxy_id: Идентификатор прокси в БД.
+        :return: Словарь с параметрами proxy/scheme для Telethon либо None.
+        """
+        try:
+            proxy = await self.db.get_proxy(proxy_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"Ошибка получения прокси id={proxy_id}: {exc}")
+            raise ClientManagerError(f"Не удалось получить прокси id={proxy_id}") from exc
+
+        if proxy is None:
+            logger.warning(f"Прокси id={proxy_id} не найден в БД")
+            return None
+
+        # Расшифровка учётных данных прокси (могут быть пустыми)
+        username: Optional[str] = (
+            self.encryption.decrypt(proxy.username) if proxy.username else None
+        )
+        password: Optional[str] = (
+            self.encryption.decrypt(proxy.password) if proxy.password else None
+        )
+
+        ptype = (proxy.type or "socks5").lower()
+        config: dict[str, Any] = {"addr": proxy.host, "port": int(proxy.port)}
+        if username:
+            config["username"] = username
+        if password:
+            config["password"] = password
+
+        if ptype in ("mtproxy", "mtproto"):
+            # MTProto-прокси: секрет передаётся в поле 'secret' (python-socks)
+            config["scheme"] = "mtproxy"
+            config["secret"] = username or ""
+        elif ptype == "http":
+            config["scheme"] = "http"
+        elif ptype == "socks4":
+            config["scheme"] = "socks4"
+        else:  # socks5 / socks — значения по умолчанию для python-socks
+            config["scheme"] = "socks5"
+
+        logger.debug(
+            f"Сформирован конфиг прокси id={proxy.id} ({proxy.name}): "
+            f"{ptype}://{proxy.host}:{proxy.port}"
+        )
+        return config
+
+    # ------------------------------------------------------------------
+    # Создание клиента из сохранённой сессии
+    # ------------------------------------------------------------------
+    async def create_client(self, account_id: int) -> TelegramClient:
+        """
+        Создание и подключение Telethon-клиента по аккаунту из БД.
+
+        :param account_id: Идентификатор аккаунта.
+        :return: Подключённый TelegramClient.
+        :raises ClientManagerError: При отсутствии аккаунта/сессии или ошибке подключения.
+        """
+        try:
+            account = await self.db.get_account(account_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"Ошибка получения аккаунта id={account_id}: {exc}")
+            raise ClientManagerError(f"Не удалось получить аккаунт id={account_id}") from exc
+
+        if account is None:
+            raise ClientManagerError(f"Аккаунт id={account_id} не найден в базе данных")
+        if not account.session_data:
+            raise ClientManagerError(
+                f"У аккаунта id={account_id} отсутствует сохранённая сессия"
+            )
+
+        # Расшифровка строковой сессии
+        try:
+            session_string = self.encryption.decrypt(account.session_data)
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"Ошибка расшифровки сессии аккаунта id={account_id}: {exc}")
+            raise ClientManagerError(
+                f"Не удалось расшифровать сессию аккаунта id={account_id}. "
+                "Возможно, мастер-ключ был изменён."
+            ) from exc
+
+        api_id, api_hash = await self.get_api_credentials()
+
+        proxy_cfg: Optional[dict[str, Any]] = None
+        if account.proxy_id is not None:
+            proxy_cfg = await self.build_proxy_config(int(account.proxy_id))
+
+        client: Optional[TelegramClient] = None
+        try:
+            client = TelegramClient(
+                StringSession(session_string),
+                api_id,
+                api_hash,
+                proxy=proxy_cfg,
+            )
+            await client.connect()
+            if not await client.is_user_authorized():
+                await client.disconnect()
+                raise ClientManagerError(
+                    f"Сессия аккаунта id={account_id} не авторизована "
+                    "(возможно, аккаунт разлогинен или забанен)"
+                )
+            logger.info(f"Клиент аккаунта id={account_id} подключён к Telegram")
+            return client
+        except ClientManagerError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"Ошибка подключения клиента аккаунта id={account_id}: {exc}")
+            if client is not None:
+                try:
+                    await client.disconnect()
+                except Exception as disconnect_exc:  # noqa: BLE001
+                    logger.warning(f"Ошибка отключения клиента: {disconnect_exc}")
+            raise ClientManagerError(format_telethon_error(exc)) from exc
+
+    # ------------------------------------------------------------------
+    # Добавление аккаунта: шаг 1 — отправка кода
+    # ------------------------------------------------------------------
+    @staticmethod
+    def normalize_phone(phone: str) -> str:
+        """
+        Нормализация номера телефона: удаляются пробелы, скобки, дефисы.
+
+        :param phone: Введённый пользователем номер.
+        :return: Номер в формате +XXXXXXXXXXX (или без +, если его не было).
+        """
+        cleaned = re.sub(r"[\s\-\(\)]+", "", phone or "")
+        return "+" + cleaned.lstrip("+") if cleaned.startswith("+") else cleaned
+
+    @classmethod
+    def validate_phone(cls, phone: str) -> bool:
+        """Проверка номера на соответствие формату E.164 (упрощённо)."""
+        return bool(_PHONE_RE.match(cls.normalize_phone(phone)))
+
+    async def add_account_by_phone(
+        self, phone: str, proxy_id: Optional[int] = None
+    ) -> dict[str, str]:
+        """
+        Шаг 1 добавления аккаунта: отправка кода подтверждения на номер.
+
+        Создаёт временного клиента с новой строковой сессией, подключается
+        к Telegram и вызывает send_code_request. Клиент после отправки
+        отключается; сессия возвращается в вызывающий код (диалог) для шага 2.
+
+        :param phone: Номер телефона в международном формате (+7...).
+        :param proxy_id: Идентификатор прокси (опционально).
+        :return: Словарь {"status": "code_sent", "phone_code_hash": hash,
+                 "session_string": строковая сессия}.
+        :raises ClientManagerError: При ошибках валидации/сети/FloodWait.
+        """
+        normalized = self.normalize_phone(phone)
+        if not _PHONE_RE.match(normalized):
+            raise ClientManagerError(
+                "Неверный формат номера телефона. Ожидается международный "
+                "формат, например +79991234567."
+            )
+
+        api_id, api_hash = await self.get_api_credentials()
+        proxy_cfg = (
+            await self.build_proxy_config(int(proxy_id))
+            if proxy_id is not None
+            else None
+        )
+
+        session_string = StringSession()
+        client: Optional[TelegramClient] = None
+        try:
+            client = TelegramClient(session_string, api_id, api_hash, proxy=proxy_cfg)
+            await client.connect()
+            sent = await client.send_code_request(normalized)
+            logger.info(
+                f"Код подтверждения отправлен на номер {normalized[:3]}***{normalized[-2:]}"
+            )
+            return {
+                "status": "code_sent",
+                "phone_code_hash": sent.phone_code_hash or "",
+                "session_string": StringSession.string_session(client.session),
+            }
+        except FloodWaitError as exc:
+            logger.warning(f"FloodWait при отправке кода: {exc.seconds} сек.")
+            raise ClientManagerError(format_telethon_error(exc)) from exc
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"Ошибка отправки кода на {normalized[:3]}***: {exc}")
+            raise ClientManagerError(format_telethon_error(exc)) from exc
+        finally:
+            # Временный клиент отключаем; сессия сохранена в session_string
+            if client is not None:
+                try:
+                    await client.disconnect()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(f"Ошибка отключения временного клиента: {exc}")
+
+    # ------------------------------------------------------------------
+    # Добавление аккаунта: шаг 2 — завершение входа
+    # ------------------------------------------------------------------
+    async def complete_login(
+        self,
+        phone: str,
+        code: str,
+        session_string: str,
+        phone_code_hash: str,
+        password_2fa: Optional[str] = None,
+        proxy_id: Optional[int] = None,
+    ) -> Account:
+        """
+        Шаг 2 добавления аккаунта: ввод кода (и 2FA при необходимости),
+        получение строковой сессии, её шифрование и сохранение аккаунта в БД.
+
+        :param phone: Номер телефона (тот же, что использовался для отправки кода).
+        :param code: Код подтверждения из SMS/Telegram.
+        :param session_string: Строковая сессия, полученная на шапе 1.
+        :param phone_code_hash: Хэш отправленного кода.
+        :param password_2fa: Пароль двухфакторной аутентификации (если включена).
+        :param proxy_id: Идентификатор прокси (опционально).
+        :return: Созданная запись Account (id заполнен).
+        :raises ClientManagerError: При неверном коде, истёкшем коде, ошибке 2FA и т.п.
+        """
+        normalized = self.normalize_phone(phone)
+        if not code or not code.strip():
+            raise ClientManagerError("Введите код подтверждения.")
+
+        api_id, api_hash = await self.get_api_credentials()
+        proxy_cfg = (
+            await self.build_proxy_config(int(proxy_id))
+            if proxy_id is not None
+            else None
+        )
+
+        client: Optional[TelegramClient] = None
+        try:
+            # Восстановление клиента из временной сессии шага 1
+            client = TelegramClient(
+                StringSession(session_string), api_id, api_hash, proxy=proxy_cfg
+            )
+            await client.connect()
+
+            # Первая попытка входа без пароля 2FA
+            try:
+                await client.sign_in(
+                    phone=normalized,
+                    code=code.strip(),
+                    phone_code_hash=phone_code_hash,
+                )
+            except SessionPasswordNeededError:
+                # Требуется 2FA
+                if not password_2fa:
+                    raise ClientManagerError(
+                        "Для этого аккаунта включена двухфакторная аутентификация. "
+                        "Введите пароль 2FA и повторите."
+                    )
+                await client.sign_in(password=password_2fa)
+
+            # Проверка авторизации
+            me = await client.get_me()
+            if me is None:
+                raise ClientManagerError("Telegram не вернул данные пользователя.")
+
+            # Сохранение строковой сессии (StringSession.save возвращает строку)
+            new_session = StringSession()
+            new_session.set_state(client.session)
+            saved_session_string = new_session.save()
+            if not saved_session_string:
+                raise ClientManagerError("Не удалось сохранить строковую сессию.")
+
+            # Шифрование сессии перед записью в БД
+            encrypted_session = self.encryption.encrypt(saved_session_string)
+
+            username = getattr(me, "username", None)
+            account = Account(
+                phone=normalized,
+                username=username,
+                session_data=encrypted_session,
+                proxy_id=proxy_id,
+                status="active",
+                last_used=None,
+            )
+            account_id = await self.db.create_account(account)
+            account.id = account_id
+
+            logger.info(
+                f"Аккаунт создан: id={account_id}, username=@{username}, "
+                f"телефон {normalized[:3]}***{normalized[-2:]}"
+            )
+            return account
+        except ClientManagerError:
+            raise
+        except FloodWaitError as exc:
+            logger.warning(f"FloodWait при входе: {exc.seconds} сек.")
+            raise ClientManagerError(format_telethon_error(exc)) from exc
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"Ошибка завершения входа для {normalized[:3]}***: {exc}")
+            raise ClientManagerError(format_telethon_error(exc)) from exc
+        finally:
+            if client is not None:
+                try:
+                    await client.disconnect()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(f"Ошибка отключения клиента: {exc}")
+
+    # ------------------------------------------------------------------
+    # Проверка работоспособности аккаунта (используется вкладкой Аккаунты)
+    # ------------------------------------------------------------------
+    async def check_account(self, account_id: int) -> str:
+        """
+        Подключение к Telegram по аккаунту для проверки валидности сессии.
+
+        :param account_id: Идентификатор аккаунта.
+        :return: Сообщение о результате (для панели логов).
+        """
+        client: Optional[TelegramClient] = None
+        try:
+            client = await self.create_client(account_id)
+            me = await client.get_me()
+            username = getattr(me, "username", None) or "без username"
+            return f"Аккаунт id={account_id} (@{username}) — сессия валидна"
+        except ClientManagerError as exc:
+            # Помечаем аккаунт как проблемный
+            try:
+                account = await self.db.get_account(account_id)
+                if account is not None:
+                    account.status = "invalid"
+                    await self.db.update_account(account)
+            except Exception as upd_exc:  # noqa: BLE001
+                logger.error(f"Не удалось обновить статус аккаунта id={account_id}: {upd_exc}")
+            return f"Аккаунт id={account_id} — ошибка: {exc}"
+        finally:
+            if client is not None:
+                try:
+                    await client.disconnect()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(f"Ошибка отключения клиента: {exc}")
