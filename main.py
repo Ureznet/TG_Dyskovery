@@ -343,6 +343,10 @@ def main() -> int:
         client_manager,
         activity_checker=activity_checker,
         threshold_days_default=int(threshold_days),
+        # Вкладка «Аккаунты» планирует задачи в общем asyncio-потоке:
+        # собственный QThread-воркер больше не нужен и именно он был
+        # источником «зависаний» отправки кода.
+        submitter=bridge.submit,
     )
     window.show()
     logger.info("Главное окно отображено")

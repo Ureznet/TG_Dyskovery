@@ -10,7 +10,7 @@
 """
 
 from datetime import datetime
-from typing import Optional
+from typing import Any, Callable, Coroutine, Optional
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor, QFont, QTextCharFormat, QTextCursor
@@ -57,18 +57,23 @@ class MainWindow(QMainWindow):
         client_manager: Optional[ClientManager] = None,
         activity_checker: Optional[ActivityChecker] = None,
         threshold_days_default: int = 7,
+        submitter: Optional[Callable[[Coroutine[Any, Any, Any]], Any]] = None,
     ) -> None:
         """
         :param db: Инициализированный менеджер базы данных.
         :param client_manager: Менеджер Telethon-клиентов (для вкладки «Аккаунты»).
         :param activity_checker: Чекер активности (для вкладки «Чекер»).
         :param threshold_days_default: Порог активности по умолчанию из настроек.
+        :param submitter: Планировщик корутин в общем asyncio-потоке приложения
+                          (main.AsyncBridge.submit) — используется вкладкой
+                          «Аккаунты», чтобы не плодить лишние фоновые потоки.
         """
         super().__init__()
         self.db: DatabaseManager = db
         self.client_manager: Optional[ClientManager] = client_manager
         self.activity_checker: Optional[ActivityChecker] = activity_checker
         self.threshold_days_default: int = threshold_days_default
+        self._submitter = submitter
 
         # Вкладка «Чекер» (создаётся в _create_central_widget)
         self.checker_tab: Optional[CheckerTab] = None
@@ -168,7 +173,9 @@ class MainWindow(QMainWindow):
 
         # Вкладка «Аккаунты» — полноценный экран управления (Шаг 2)
         if self.client_manager is not None:
-            self.accounts_tab = AccountsWindow(self.db, self.client_manager)
+            self.accounts_tab = AccountsWindow(
+                self.db, self.client_manager, submitter=self._submitter
+            )
             self.accounts_tab.accounts_changed.connect(self._on_accounts_changed)
         else:
             # Резервный вариант без менеджера клиентов (не должно случаться)

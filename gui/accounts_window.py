@@ -15,7 +15,7 @@ import re
 from typing import Any, Callable, Coroutine, Optional
 
 from loguru import logger
-from PySide6.QtCore import QThread, Qt, Signal, Slot
+from PySide6.QtCore import QObject, QThread, Qt, Signal, Slot
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
@@ -99,6 +99,21 @@ class AsyncWorker(QThread):
 
 
 # ----------------------------------------------------------------------
+# Мост статусов из asyncio-потока в Qt-поток
+# ----------------------------------------------------------------------
+class _StatusBridge(QObject):
+    """
+    Вспомогательный QObject для потокобезопасной доставки этапов входа.
+
+    Колбэки on_status вызываются из фоновых потоков (AsyncWorker /
+    main.AsyncBridge); emit() Qt-сигнала из любого потока безопасен, а слот
+    выполняется уже в потоке GUI (queued connection).
+    """
+
+    status = Signal(str)  # "connecting" | "connected" | "done" | "timeout"
+
+
+# ----------------------------------------------------------------------
 # Диалог добавления аккаунта
 # ----------------------------------------------------------------------
 _PHONE_RE = re.compile(r"^\+?[0-9]{5,16}$")
@@ -119,18 +134,28 @@ class AddAccountDialog(QDialog):
 
     def __init__(
         self, db: DatabaseManager, client_manager: ClientManager,
-        worker: AsyncWorker, parent: Optional[QWidget] = None,
+        worker: Optional[AsyncWorker] = None, parent: Optional[QWidget] = None,
+        submitter: Optional[Callable[[Coroutine[Any, Any, Any]], None]] = None,
     ) -> None:
         """
         :param db: Менеджер БД (для загрузки списка прокси).
         :param client_manager: Менеджер Telethon-клиентов.
-        :param worker: Фоновый поток исполнения asyncio-задач.
+        :param worker: Фоновый поток исполнения asyncio-задач (AsyncWorker).
         :param parent: Родительский виджет.
+        :param submitter: Альтернативный планировщик корутин (main.AsyncBridge).
+                          Используется, если worker не передан; колбэки
+                          результатов вызываются через QTimer.singleShot.
         """
         super().__init__(parent)
         self.db = db
         self.client_manager = client_manager
         self.worker = worker
+        self._submitter = submitter
+
+        if self.worker is None and self._submitter is None:
+            raise ValueError(
+                "AddAccountDialog: требуется либо worker, либо submitter"
+            )
 
         # Данные шага 1 (отправка кода), необходимые для шага 2
         self._phone_code_hash: str = ""
@@ -139,18 +164,23 @@ class AddAccountDialog(QDialog):
 
         self.setWindowTitle("Добавление аккаунта Telegram")
         self.setModal(True)
-        self.setMinimumWidth(420)
+        self.setMinimumWidth(460)
 
         # Очередь «разбирающих» колбэков: результат может относиться
         # к разным задачам, поэтому используется FIFO-очередь обработчиков.
         self._handlers: list[tuple[Callable[[Any], None], Callable[[str], None]]] = []
 
+        # Мост статусов из asyncio-потока в Qt-поток
+        self._status_bridge = _StatusBridge(self)
+        self._status_bridge.status.connect(self._on_login_status)
+
         self._build_ui()
         self._connect_signals()
 
-        # Диспетчер результатов воркера (подключаем до постановки задач)
-        self.worker.task_finished.connect(self._dispatch_result)
-        self.worker.task_failed.connect(self._dispatch_failure)
+        if self.worker is not None:
+            # Диспетчер результатов воркера (подключаем до постановки задач)
+            self.worker.task_finished.connect(self._dispatch_result)
+            self.worker.task_failed.connect(self._dispatch_failure)
 
         # Загрузка списка прокси сразу после открытия
         self._run_async(
@@ -182,18 +212,28 @@ class AddAccountDialog(QDialog):
         self.btn_send_code = QPushButton("Отправить код")
         layout.addWidget(self.btn_send_code)
 
-        # --- Шаг 2: код и 2FA (скрыт до успешной отправки кода) ---
+        # --- Шаг 2: код и облачный пароль (скрыт до успешной отправки кода) ---
         self.step2_widget = QWidget()
         form2 = QFormLayout(self.step2_widget)
 
         self.code_edit = QLineEdit()
-        self.code_edit.setPlaceholderText("Код (например, 12345)")
+        self.code_edit.setPlaceholderText("Код из SMS / звонка / приложения Telegram")
         form2.addRow("Код подтверждения:", self.code_edit)
 
         self.password_edit = QLineEdit()
         self.password_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        self.password_edit.setPlaceholderText("Только если включена 2FA")
+        self.password_edit.setPlaceholderText("Облачный пароль (если включена 2FA)")
         form2.addRow("Пароль 2FA (опц.):", self.password_edit)
+
+        # Подсказка про вход без SMS (облачный пароль)
+        hint = QLabel(
+            "SMS не приходит? Если на аккаунте включено двухфакторное "
+            "шифрование — оставьте поле кода пустым, введите облачный "
+            "пароль и нажмите «Войти по облачному паролю»."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #555; font-size: 11px;")
+        form2.addRow(hint)
 
         self.step2_widget.setVisible(False)
         layout.addWidget(self.step2_widget)
@@ -202,9 +242,18 @@ class AddAccountDialog(QDialog):
         self.btn_finish.setEnabled(False)
         layout.addWidget(self.btn_finish)
 
+        # Отдельная кнопка входа сразу по облачному паролю (без SMS-кода)
+        self.btn_password_login = QPushButton("Войти по облачному паролю (без SMS)")
+        self.btn_password_login.setEnabled(False)
+        self.btn_password_login.setToolTip(
+            "Работает, если на аккаунте включена 2FA. Код из SMS при этом не нужен."
+        )
+        layout.addWidget(self.btn_password_login)
+
         # Статусная строка
         self.status_label = QLabel("")
         self.status_label.setStyleSheet("color: #555;")
+        self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
 
         btn_box = QHBoxLayout()
@@ -217,7 +266,20 @@ class AddAccountDialog(QDialog):
         """Подключение кнопок."""
         self.btn_send_code.clicked.connect(self.on_send_code)
         self.btn_finish.clicked.connect(self.on_finish_login)
+        self.btn_password_login.clicked.connect(self.on_password_login)
         self.btn_cancel.clicked.connect(self.reject)
+
+    # ------------------------- Статусы входа -------------------------
+    @Slot(str)
+    def _on_login_status(self, stage: str) -> None:
+        """Отображение текущего этапа сетевого взаимодействия с Telegram."""
+        texts = {
+            "connecting": "Подключение к серверам Telegram…",
+            "connected": "Соединение установлено. Отправка запроса…",
+            "done": "Готово.",
+            "timeout": "Серверы Telegram не отвечают (таймаут соединения).",
+        }
+        self.status_label.setText(texts.get(stage, stage))
 
     # ------------------------- Результаты -------------------------
     @Slot(object)
@@ -240,9 +302,39 @@ class AddAccountDialog(QDialog):
         on_success: Callable[[Any], None],
         on_error: Callable[[str], None],
     ) -> None:
-        """Запуск asyncio-задачи в воркере с регистрацией колбэков."""
+        """
+        Запуск asyncio-задачи с регистрацией колбэков (FIFO).
+
+        Поддерживает два исполнителя: AsyncWorker (QThread) или внешний
+        submitter (main.AsyncBridge) — колбэки всегда доставляются в Qt-поток.
+        """
         self._handlers.append((on_success, on_error))
-        self.worker.submit(coro_factory)
+        if self.worker is not None:
+            self.worker.submit(coro_factory)
+            return
+
+        # Режим внешнего планировщика (AsyncBridge): подписываемся на
+        # Future и переносим результат в Qt-поток через QTimer.singleShot.
+        from PySide6.QtCore import QTimer
+
+        try:
+            future = self._submitter(coro_factory())  # type: ignore[misc]
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"Ошибка планирования задачи диалога: {exc}")
+            QTimer.singleShot(0, lambda: self._dispatch_failure(str(exc)))
+            return
+
+        def _done(fut: Any) -> None:
+            """Колбэк завершения в asyncio-потоке — переносим в Qt-поток."""
+            try:
+                result = fut.result()
+            except Exception as exc:  # noqa: BLE001
+                text = str(exc) or exc.__class__.__name__
+                QTimer.singleShot(0, lambda t=text: self._dispatch_failure(t))
+                return
+            QTimer.singleShot(0, lambda r=result: self._dispatch_result(r))
+
+        future.add_done_callback(_done)
 
     @Slot(object)
     def _on_proxies_loaded(self, proxies: list) -> None:
@@ -293,9 +385,15 @@ class AddAccountDialog(QDialog):
             self._session_string = result.get("session_string", "")
             self.step2_widget.setVisible(True)
             self.btn_finish.setEnabled(True)
+            self.btn_password_login.setEnabled(True)
             self.btn_send_code.setEnabled(True)
             self.btn_send_code.setText("Отправить код ещё раз")
-            self.status_label.setText("Код отправлен. Введите его ниже.")
+            self.status_label.setText(
+                "Запрос кода выполнен. Проверьте SMS, звонок и приложение "
+                "Telegram (код может прийти в существующую сессию). "
+                "Если включена 2FA и SMS не приходит — используйте вход по "
+                "облачному паролю."
+            )
             self.code_edit.setFocus()
 
         def on_error(err: str) -> None:
@@ -303,29 +401,47 @@ class AddAccountDialog(QDialog):
             self.status_label.setText("")
             QMessageBox.critical(self, "Ошибка отправки кода", err)
 
+        # Колбэк статусов из asyncio-потока -> Qt-поток через мост
+        status_cb = lambda stage: self._status_bridge.status.emit(stage)  # noqa: E731
+
         self._run_async(
-            lambda: self.client_manager.add_account_by_phone(phone, self._proxy_id),
+            lambda: self.client_manager.add_account_by_phone(
+                phone, self._proxy_id, on_status=status_cb
+            ),
             on_success,
             on_error,
         )
 
     # ------------------------- Шаг 2: завершение входа -------------------------
-    def on_finish_login(self) -> None:
-        """Ввод кода (и 2FA) и сохранение аккаунта в БД."""
+    def _finish_login_common(
+        self, code: str, password_2fa: Optional[str], login_mode: str
+    ) -> None:
+        """
+        Общий код завершения входа (по коду или сразу по облачному паролю).
+
+        :param code: Введённый код (пусто = вход только по паролю).
+        :param password_2fa: Облачный пароль либо None.
+        :param login_mode: Режим для статуса ("code" | "password").
+        """
         phone = self._validate_phone()
         if phone is None:
             return
 
-        code = self.code_edit.text().strip()
-        if not code:
-            QMessageBox.warning(self, "Нет кода", "Введите код подтверждения.")
+        if not self._session_string or not self._phone_code_hash:
+            QMessageBox.warning(
+                self, "Нет данных шага 1",
+                "Сначала нажмите «Отправить код» — вход выполняется "
+                "на той же сессии, что и запрос кода.",
+            )
             return
 
-        password_2fa = self.password_edit.text().strip() or None
-
         self.btn_finish.setEnabled(False)
+        self.btn_password_login.setEnabled(False)
         self.btn_send_code.setEnabled(False)
-        self.status_label.setText("Завершение входа...")
+        self.status_label.setText(
+            "Вход по облачному паролю..." if login_mode == "password"
+            else "Проверка кода..."
+        )
 
         def on_success(account: Account) -> None:
             """Аккаунт создан — закрываем диалог с успехом."""
@@ -339,9 +455,13 @@ class AddAccountDialog(QDialog):
 
         def on_error(err: str) -> None:
             self.btn_finish.setEnabled(True)
+            self.btn_password_login.setEnabled(True)
             self.btn_send_code.setEnabled(True)
             self.status_label.setText("")
             QMessageBox.critical(self, "Ошибка входа", err)
+
+        # Колбэк статусов из asyncio-потока -> Qt-поток через мост
+        status_cb = lambda stage: self._status_bridge.status.emit(stage)  # noqa: E731
 
         self._run_async(
             lambda: self.client_manager.complete_login(
@@ -351,10 +471,54 @@ class AddAccountDialog(QDialog):
                 phone_code_hash=self._phone_code_hash,
                 password_2fa=password_2fa,
                 proxy_id=self._proxy_id,
+                on_status=status_cb,
             ),
             on_success,
             on_error,
         )
+
+    def on_finish_login(self) -> None:
+        """Ввод кода (и 2FA при необходимости) и сохранение аккаунта в БД."""
+        code = self.code_edit.text().strip()
+        password_2fa = self.password_edit.text().strip() or None
+
+        if not code and not password_2fa:
+            QMessageBox.warning(
+                self, "Нет данных для входа",
+                "Введите код подтверждения либо облачный пароль (2FA).",
+            )
+            return
+
+        self._finish_login_common(code, password_2fa, "code")
+
+    def on_password_login(self) -> None:
+        """
+        Вход СРАЗУ по облачному паролю без SMS-кода.
+
+        Подходит, когда Telegram не доставляет SMS (лимиты, блокировка
+        доставки), но на аккаунте включена двухфакторная аутентификация:
+        сервер принимает sign_in(password=...) без предварительного кода.
+        """
+        password_2fa = self.password_edit.text().strip() or None
+        if not password_2fa:
+            QMessageBox.warning(
+                self, "Нет пароля",
+                "Введите облачный пароль (2FA) перед входом без SMS-кода.",
+            )
+            return
+
+        reply = QMessageBox.question(
+            self, "Вход по облачному паролю",
+            "Выполнить вход без ввода SMS-кода, только по облачному "
+            "паролю (2FA)?\n\nЭтот способ работает, если на аккаунте "
+            "включено двухфакторное шифрование.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        self._finish_login_common("", password_2fa, "password")
 
 
 # ----------------------------------------------------------------------
@@ -376,21 +540,29 @@ class AccountsWindow(QWidget):
     def __init__(
         self, db: DatabaseManager, client_manager: ClientManager,
         parent: Optional[QWidget] = None,
+        submitter: Optional[Callable[[Coroutine[Any, Any, Any]], None]] = None,
     ) -> None:
         """
         :param db: Менеджер базы данных.
         :param client_manager: Менеджер Telethon-клиентов.
         :param parent: Родительский виджет.
+        :param submitter: Планировщик корутин в общем asyncio-потоке приложения
+                          (main.AsyncBridge.submit). Если не передан — создаётся
+                          собственный AsyncWorker (QThread).
         """
         super().__init__(parent)
         self.db = db
         self.client_manager = client_manager
+        self._submitter = submitter
 
-        # Фоновый исполнитель asyncio-задач для этого экрана
-        self.worker = AsyncWorker(self)
-        self.worker.start()
-        # Связываем завершение потока с очисткой
-        self.destroyed.connect(self._shutdown_worker)
+        # Фоновый исполнитель asyncio-задач для этого экрана:
+        # общий мост приложения либо собственный поток
+        self.worker: Optional[AsyncWorker] = None
+        if self._submitter is None:
+            self.worker = AsyncWorker(self)
+            self.worker.start()
+            # Связываем завершение потока с очисткой
+            self.destroyed.connect(self._shutdown_worker)
 
         self._accounts: list[Account] = []
         self._handlers: list[tuple[Callable[[Any], None], Callable[[str], None]]] = []
@@ -401,7 +573,8 @@ class AccountsWindow(QWidget):
     def _shutdown_worker(self) -> None:
         """Остановка фонового потока при уничтожении виджета."""
         try:
-            self.worker.stop()
+            if self.worker is not None:
+                self.worker.stop()
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"Ошибка остановки воркера аккаунтов: {exc}")
 
@@ -444,9 +617,10 @@ class AccountsWindow(QWidget):
 
         layout.addWidget(self.table)
 
-        # Подключаем диспетчер результатов воркера
-        self.worker.task_finished.connect(self._dispatch_result)
-        self.worker.task_failed.connect(self._dispatch_failure)
+        # Подключаем диспетчер результатов воркера (если используется свой поток)
+        if self.worker is not None:
+            self.worker.task_finished.connect(self._dispatch_result)
+            self.worker.task_failed.connect(self._dispatch_failure)
 
     # ------------------------- Диспетчер задач -------------------------
     def _run_async(
@@ -457,7 +631,31 @@ class AccountsWindow(QWidget):
     ) -> None:
         """Запуск задачи в воркере с очередью обработчиков (FIFO)."""
         self._handlers.append((on_success, on_error or self._default_error))
-        self.worker.submit(coro_factory)
+        if self.worker is not None:
+            self.worker.submit(coro_factory)
+            return
+
+        # Режим общего моста приложения (main.AsyncBridge)
+        from PySide6.QtCore import QTimer
+
+        try:
+            future = self._submitter(coro_factory())  # type: ignore[misc]
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"Ошибка планирования задачи аккаунтов: {exc}")
+            QTimer.singleShot(0, lambda t=str(exc): self._dispatch_failure(t))
+            return
+
+        def _done(fut: Any) -> None:
+            """Колбэк завершения в asyncio-потоке — переносим в Qt-поток."""
+            try:
+                result = fut.result()
+            except Exception as exc:  # noqa: BLE001
+                text = str(exc) or exc.__class__.__name__
+                QTimer.singleShot(0, lambda t=text: self._dispatch_failure(t))
+                return
+            QTimer.singleShot(0, lambda r=result: self._dispatch_result(r))
+
+        future.add_done_callback(_done)
 
     @Slot(object)
     def _dispatch_result(self, result: Any) -> None:
@@ -558,7 +756,13 @@ class AccountsWindow(QWidget):
     # ------------------------- Диалог добавления -------------------------
     def open_add_dialog(self) -> None:
         """Открытие диалога добавления аккаунта."""
-        dialog = AddAccountDialog(self.db, self.client_manager, self.worker, self)
+        dialog = AddAccountDialog(
+            self.db,
+            self.client_manager,
+            worker=self.worker,
+            parent=self,
+            submitter=self._submitter,
+        )
         dialog.account_added.connect(self._on_account_added)
         dialog.exec()
 

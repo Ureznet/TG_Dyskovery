@@ -13,9 +13,10 @@
 (в приложении — фоновый loop AsyncBridge), чтобы не блокировать GUI.
 """
 
+import asyncio
 import os
 import re
-from typing import Any, Optional
+from typing import Any, Callable, Coroutine, Optional
 
 from loguru import logger
 from telethon import TelegramClient
@@ -32,7 +33,10 @@ from telethon.errors import (
     PhoneNumberInvalidError,
     PhoneNotOccupiedError,
     SessionPasswordNeededError,
+    SRPCallFailedError,
+    YouBlockedUserError,
 )
+from telethon.network import ConnectionTcpFull
 from telethon.sessions import StringSession
 
 from database.db import DatabaseManager
@@ -90,6 +94,21 @@ def format_telethon_error(exc: Exception) -> str:
         return f"Слишком много попыток. Повторите через {int(getattr(exc, 'seconds', 0))} сек."
     if isinstance(exc, (ApiIdInvalidError, AuthKeyDuplicatedError)):
         return "Неверные api_id / api_hash или конфликт сессии. Проверьте настройки Telegram API."
+    if isinstance(exc, YouBlockedUserError):
+        return (
+            "Вы заблокировали сервисный аккаунт Telegram (@SpamBot) в другом "
+            "приложении — разблокируйте его и повторите."
+        )
+    if isinstance(exc, (ConnectionError, OSError, SRPCallFailedError, asyncio.TimeoutError)):
+        return (
+            "Нет соединения с серверами Telegram (ошибка сети).\n\n"
+            "Возможные причины:\n"
+            "1) Блокировка MTProto-портов (80/443) провайдером или файрволом — "
+            "включите прокси (MTProto/socks5) либо VPN;\n"
+            "2) Антивирус/файрвол блокирует приложение;\n"
+            "3) Неверные api_id/api_hash.\n"
+            "Код при этом НЕ отправлялся."
+        )
     if isinstance(exc, BadRequestError):
         return f"Telegram отклонил запрос: {exc}"
     return f"Ошибка Telegram: {exc}"
@@ -291,8 +310,86 @@ class ClientManager:
         """Проверка номера на соответствие формату E.164 (упрощённо)."""
         return bool(_PHONE_RE.match(cls.normalize_phone(phone)))
 
+    # ------------------------------------------------------------------
+    # Внутренний помощник: временный клиент с таймаутами и статус-колбэками
+    # ------------------------------------------------------------------
+    async def _run_temp_client(
+        self,
+        session: "StringSession",
+        proxy_cfg: Optional[dict[str, Any]],
+        action: Callable[[TelegramClient], Coroutine[Any, Any, Any]],
+        on_status: Optional[Callable[[str], None]] = None,
+        connect_timeout: float = 25.0,
+        request_timeout: float = 35.0,
+    ) -> Any:
+        """
+        Выполнение действия над временным TelegramClient с жёсткими таймаутами.
+
+        Гарантирует:
+        - отчёт об этапах через on_status ("connecting"/"connected"/"done"),
+          чтобы GUI показывал прогресс и не выглядел «зависшим»;
+        - прерывание операции по таймауту (connect / request);
+        - гарантированное отключение клиента в finally.
+
+        :param session: Объект StringSession (новый или восстановленный).
+        :param proxy_cfg: Конфиг прокси либо None.
+        :param action: Асинхронная функция, получающая подключённый клиент.
+        :param on_status: Колбэк этапов (вызывается из asyncio-потока).
+        :param connect_timeout: Таймаут подключения к серверам Telegram, сек.
+        :param request_timeout: Таймаут самого запроса (send_code/sign_in), сек.
+        :return: Результат выполнения action.
+        """
+        api_id, api_hash = await self.get_api_credentials()
+
+        def _status(text: str) -> None:
+            """Безопасный вызов колбэка статуса."""
+            if on_status is not None:
+                try:
+                    on_status(text)
+                except Exception as cb_exc:  # noqa: BLE001
+                    logger.warning(f"Ошибка колбэка статуса: {cb_exc}")
+
+        client: Optional[TelegramClient] = None
+        try:
+            client = TelegramClient(
+                session,
+                api_id,
+                api_hash,
+                proxy=proxy_cfg,
+                connection=ConnectionTcpFull,
+                request_retries=1,
+                connection_retries=1,
+                auto_reconnect=False,
+            )
+            _status("connecting")
+            await asyncio.wait_for(client.connect(), timeout=connect_timeout)
+            _status("connected")
+
+            result = await asyncio.wait_for(action(client), timeout=request_timeout)
+            _status("done")
+            return result
+        except asyncio.TimeoutError as exc:
+            _status("timeout")
+            raise ClientManagerError(
+                "Превышено время ожидания ответа от серверов Telegram.\n\n"
+                "Чаще всего это означает, что соединение заблокировано:\n"
+                "1) Попробуйте включить прокси (MTProto/socks5) в этом диалоге;\n"
+                "2) Или используйте VPN;\n"
+                "3) Проверьте антивирус/файрвол — он может блокировать приложение.\n"
+                "Код НЕ был отправлен."
+            ) from exc
+        finally:
+            if client is not None:
+                try:
+                    await asyncio.wait_for(client.disconnect(), timeout=10.0)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(f"Ошибка отключения временного клиента: {exc}")
+
     async def add_account_by_phone(
-        self, phone: str, proxy_id: Optional[int] = None
+        self,
+        phone: str,
+        proxy_id: Optional[int] = None,
+        on_status: Optional[Callable[[str], None]] = None,
     ) -> dict[str, str]:
         """
         Шаг 1 добавления аккаунта: отправка кода подтверждения на номер.
@@ -301,8 +398,15 @@ class ClientManager:
         к Telegram и вызывает send_code_request. Клиент после отправки
         отключается; сессия возвращается в вызывающий код (диалог) для шага 2.
 
+        ВАЖНО про SMS: Telegram сначала пытается доставить код в другие
+        устройства (официальные приложения), затем звонком или SMS. Если у
+        аккаунта включена 2FA, SMS может не приходить вовсе — в этом случае
+        на шаге 2 достаточно оставить поле кода пустым и ввести облачный
+        пароль (см. complete_login).
+
         :param phone: Номер телефона в международном формате (+7...).
         :param proxy_id: Идентификатор прокси (опционально).
+        :param on_status: Колбэк этапов ("connecting"/"connected"/...) для GUI.
         :return: Словарь {"status": "code_sent", "phone_code_hash": hash,
                  "session_string": строковая сессия}.
         :raises ClientManagerError: При ошибках валидации/сети/FloodWait.
@@ -314,45 +418,43 @@ class ClientManager:
                 "формат, например +79991234567."
             )
 
-        api_id, api_hash = await self.get_api_credentials()
         proxy_cfg = (
             await self.build_proxy_config(int(proxy_id))
             if proxy_id is not None
             else None
         )
 
-        session_string = StringSession()
-        client: Optional[TelegramClient] = None
-        try:
-            client = TelegramClient(session_string, api_id, api_hash, proxy=proxy_cfg)
-            await client.connect()
+        session = StringSession()
+
+        async def _send_code(client: TelegramClient) -> dict[str, str]:
+            """Отправка кода и извлечение сессии ДО disconnect()."""
             sent = await client.send_code_request(normalized)
             # ВАЖНО: извлекаем строковую сессию ДО отключения клиента.
             # При disconnect() Telethon очищает серверный nonce авторизации,
-            # и последующий sign_in на шаге 2 завершался бы ошибкой,
-            # несмотря на успешно отправленное SMS.
+            # и последующий sign_in на шаге 2 завершался бы ошибкой.
             result_session = StringSession.save(client.session)
             logger.info(
-                f"Код подтверждения отправлен на номер {normalized[:3]}***{normalized[-2:]}"
+                f"Код подтверждения запрошен для номера "
+                f"{normalized[:3]}***{normalized[-2:]}"
             )
             return {
                 "status": "code_sent",
                 "phone_code_hash": sent.phone_code_hash or "",
                 "session_string": result_session,
             }
+
+        try:
+            return await self._run_temp_client(
+                session, proxy_cfg, _send_code, on_status=on_status
+            )
+        except ClientManagerError:
+            raise
         except FloodWaitError as exc:
             logger.warning(f"FloodWait при отправке кода: {exc.seconds} сек.")
             raise ClientManagerError(format_telethon_error(exc)) from exc
         except Exception as exc:  # noqa: BLE001
             logger.error(f"Ошибка отправки кода на {normalized[:3]}***: {exc}")
             raise ClientManagerError(format_telethon_error(exc)) from exc
-        finally:
-            # Временный клиент отключаем; сессия сохранена в session_string
-            if client is not None:
-                try:
-                    await client.disconnect()
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning(f"Ошибка отключения временного клиента: {exc}")
 
     # ------------------------------------------------------------------
     # Добавление аккаунта: шаг 2 — завершение входа
@@ -365,54 +467,69 @@ class ClientManager:
         phone_code_hash: str,
         password_2fa: Optional[str] = None,
         proxy_id: Optional[int] = None,
+        on_status: Optional[Callable[[str], None]] = None,
     ) -> Account:
         """
         Шаг 2 добавления аккаунта: ввод кода (и 2FA при необходимости),
         получение строковой сессии, её шифрование и сохранение аккаунта в БД.
 
+        Поддерживается вход ТОЛЬКО по облачному паролю (2FA): если поле
+        ``code`` пустое, выполняется немедленный вызов sign_in(password=...)
+        без SMS-кода — Telegram это разрешает для аккаунтов с включённой
+        двухфакторной аутентификацией (SMS при этом не приходит намеренно).
+
         :param phone: Номер телефона (тот же, что использовался для отправки кода).
-        :param code: Код подтверждения из SMS/Telegram.
-        :param session_string: Строковая сессия, полученная на шапе 1.
+        :param code: Код подтверждения из SMS/Telegram; пусто = вход по 2FA-паролю.
+        :param session_string: Строковая сессия, полученная на шаге 1.
         :param phone_code_hash: Хэш отправленного кода.
-        :param password_2fa: Пароль двухфакторной аутентификации (если включена).
+        :param password_2fa: Пароль двухфакторной аутентификации (облачный пароль).
         :param proxy_id: Идентификатор прокси (опционально).
+        :param on_status: Колбэк этапов ("connecting"/"connected"/...) для GUI.
         :return: Созданная запись Account (id заполнен).
         :raises ClientManagerError: При неверном коде, истёкшем коде, ошибке 2FA и т.п.
         """
         normalized = self.normalize_phone(phone)
-        if not code or not code.strip():
-            raise ClientManagerError("Введите код подтверждения.")
+        clean_code = (code or "").strip()
+        clean_password = (password_2fa or "").strip() or None
 
-        api_id, api_hash = await self.get_api_credentials()
+        if not clean_code and not clean_password:
+            raise ClientManagerError(
+                "Введите код подтверждения либо облачный пароль (2FA)."
+            )
+
         proxy_cfg = (
             await self.build_proxy_config(int(proxy_id))
             if proxy_id is not None
             else None
         )
 
-        client: Optional[TelegramClient] = None
-        try:
-            # Восстановление клиента из временной сессии шага 1
-            client = TelegramClient(
-                StringSession(session_string), api_id, api_hash, proxy=proxy_cfg
-            )
-            await client.connect()
-
-            # Первая попытка входа без пароля 2FA
+        async def _sign_in_and_save(client: TelegramClient) -> Account:
+            """Выполнение sign_in и сохранение аккаунта в БД."""
             try:
-                await client.sign_in(
-                    phone=normalized,
-                    code=code.strip(),
-                    phone_code_hash=phone_code_hash,
-                )
-            except SessionPasswordNeededError:
-                # Требуется 2FA
-                if not password_2fa:
-                    raise ClientManagerError(
-                        "Для этого аккаунта включена двухфакторная аутентификация. "
-                        "Введите пароль 2FA и повторите."
-                    )
-                await client.sign_in(password=password_2fa)
+                if clean_code:
+                    # Обычный вход: код (+ 2FA, если потребуется)
+                    try:
+                        await client.sign_in(
+                            phone=normalized,
+                            code=clean_code,
+                            phone_code_hash=phone_code_hash,
+                        )
+                    except SessionPasswordNeededError:
+                        # Требуется облачный пароль (2FA)
+                        if not clean_password:
+                            raise ClientManagerError(
+                                "Для этого аккаунта включена двухфакторная "
+                                "аутентификация. Введите облачный пароль (2FA) "
+                                "и повторите."
+                            )
+                        await client.sign_in(password=clean_password)
+                else:
+                    # Вход СРАЗУ по облачному паролю, без SMS-кода.
+                    # Работает для аккаунтов с включённой 2FA — именно этот
+                    # способ нужно использовать, когда SMS не приходят.
+                    await client.sign_in(password=clean_password)
+            except ClientManagerError:
+                raise
 
             # Проверка авторизации
             me = await client.get_me()
@@ -420,9 +537,7 @@ class ClientManager:
                 raise ClientManagerError("Telegram не вернул данные пользователя.")
 
             # Сохранение строковой сессии (StringSession.save возвращает строку)
-            new_session = StringSession()
-            new_session.set_state(client.session)
-            saved_session_string = new_session.save()
+            saved_session_string = StringSession.save(client.session)
             if not saved_session_string:
                 raise ClientManagerError("Не удалось сохранить строковую сессию.")
 
@@ -446,6 +561,14 @@ class ClientManager:
                 f"телефон {normalized[:3]}***{normalized[-2:]}"
             )
             return account
+
+        try:
+            return await self._run_temp_client(
+                StringSession(session_string),
+                proxy_cfg,
+                _sign_in_and_save,
+                on_status=on_status,
+            )
         except ClientManagerError:
             raise
         except FloodWaitError as exc:
@@ -454,12 +577,6 @@ class ClientManager:
         except Exception as exc:  # noqa: BLE001
             logger.error(f"Ошибка завершения входа для {normalized[:3]}***: {exc}")
             raise ClientManagerError(format_telethon_error(exc)) from exc
-        finally:
-            if client is not None:
-                try:
-                    await client.disconnect()
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning(f"Ошибка отключения клиента: {exc}")
 
     # ------------------------------------------------------------------
     # Проверка работоспособности аккаунта (используется вкладкой Аккаунты)
