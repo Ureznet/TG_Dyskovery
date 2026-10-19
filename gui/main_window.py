@@ -31,6 +31,8 @@ from PySide6.QtWidgets import (
 
 from database.db import DatabaseManager
 from gui.accounts_window import AccountsWindow
+from gui.checker_tab import CheckerTab
+from telegram_client.activity_checker import ActivityChecker
 from telegram_client.client_manager import ClientManager
 
 # Цвета уровней в панели логов
@@ -50,15 +52,26 @@ class MainWindow(QMainWindow):
     log_received = Signal(str, str)            # (level, message)
 
     def __init__(
-        self, db: DatabaseManager, client_manager: Optional[ClientManager] = None
+        self,
+        db: DatabaseManager,
+        client_manager: Optional[ClientManager] = None,
+        activity_checker: Optional[ActivityChecker] = None,
+        threshold_days_default: int = 7,
     ) -> None:
         """
         :param db: Инициализированный менеджер базы данных.
         :param client_manager: Менеджер Telethon-клиентов (для вкладки «Аккаунты»).
+        :param activity_checker: Чекер активности (для вкладки «Чекер»).
+        :param threshold_days_default: Порог активности по умолчанию из настроек.
         """
         super().__init__()
         self.db: DatabaseManager = db
         self.client_manager: Optional[ClientManager] = client_manager
+        self.activity_checker: Optional[ActivityChecker] = activity_checker
+        self.threshold_days_default: int = threshold_days_default
+
+        # Вкладка «Чекер» (создаётся в _create_central_widget)
+        self.checker_tab: Optional[CheckerTab] = None
 
         # Счётчики для индикатора статуса
         self._active_tasks_count: int = 0
@@ -127,8 +140,31 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget()
         self.tabs.addTab(self._create_placeholder_tab(
             "Dashboard", "Выберите задачу или создайте новую"), "Dashboard")
-        self.tabs.addTab(self._create_placeholder_tab(
-            "Checker", "Введите список каналов для проверки"), "Чекер")
+
+        # Вкладка «Чекер» — полноценная проверка активности (Шаг 3)
+        if self.client_manager is not None and self.activity_checker is not None:
+            self.checker_tab = CheckerTab(
+                self.db,
+                self.client_manager,
+                self.activity_checker,
+                threshold_days_default=self.threshold_days_default,
+            )
+            # Трансляция событий чекера в панель логов главного окна
+            self.checker_tab.check_started.connect(
+                lambda n: self.log_message("INFO", f"Начата проверка {n} каналов")
+            )
+            self.checker_tab.check_completed.connect(
+                lambda n: self.log_message("INFO", f"Проверка завершена, результатов: {n}")
+            )
+            self.checker_tab.check_error.connect(
+                lambda err: self.log_message("ERROR", f"Ошибка проверки: {err}")
+            )
+            self.tabs.addTab(self.checker_tab, "Чекер")
+        else:
+            # Резервная заглушка, если модули ещё не инициализированы
+            self.checker_tab = None
+            self.tabs.addTab(self._create_placeholder_tab(
+                "Checker", "Введите список каналов для проверки"), "Чекер")
 
         # Вкладка «Аккаунты» — полноценный экран управления (Шаг 2)
         if self.client_manager is not None:
@@ -264,6 +300,11 @@ class MainWindow(QMainWindow):
     # Обработчики событий окон
     # ------------------------------------------------------------------
     def closeEvent(self, event) -> None:  # noqa: N802 (Qt API)
-        """Корректное закрытие окна."""
+        """Корректное закрытие окна: остановка фоновых воркеров."""
         self.log_message("INFO", "Завершение работы приложения")
+        try:
+            if getattr(self, "checker_tab", None) is not None:
+                self.checker_tab.shutdown()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"Ошибка остановки чекера: {exc}")
         super().closeEvent(event)

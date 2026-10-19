@@ -30,9 +30,12 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
+# Логирование (loguru) используется в модулях приложения; импорт здесь —
+# для единообразной инициализации при старте.
 from database.db import DatabaseManager
 from database.settings import SettingsManager
 from gui.main_window import MainWindow
+from telegram_client.activity_checker import ActivityChecker
 from telegram_client.client_manager import ClientManager
 from utils.encryption import EncryptionManager
 from utils.logger import setup_logger
@@ -319,7 +322,28 @@ def main() -> int:
     client_manager = ClientManager(bridge.db, encryption)
     logger.info("ClientManager инициализирован")
 
-    window = MainWindow(bridge.db, client_manager)
+    # Чекер активности каналов (использует тот же мост к БД/настройкам)
+    if bridge.settings is None:  # защита типов для статических анализаторов
+        logger.error("SettingsManager не инициализирован")
+        return 1
+    activity_checker = ActivityChecker(client_manager, bridge.db, bridge.settings)
+    logger.info("ActivityChecker инициализирован")
+
+    # Порог активности по умолчанию из настроек — для спинбокса вкладки «Чекер»
+    threshold_days = 7
+    try:
+        threshold_days = bridge.submit(
+            bridge.settings.get_activity_threshold_days()
+        ).result(timeout=5)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"Не удалось прочитать порог активности из настроек: {exc}")
+
+    window = MainWindow(
+        bridge.db,
+        client_manager,
+        activity_checker=activity_checker,
+        threshold_days_default=int(threshold_days),
+    )
     window.show()
     logger.info("Главное окно отображено")
 
