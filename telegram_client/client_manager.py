@@ -33,11 +33,26 @@ from telethon.errors import (
     PhoneNumberInvalidError,
     PhoneNotOccupiedError,
     SessionPasswordNeededError,
-    SRPCallFailedError,
     YouBlockedUserError,
 )
 from telethon.network import ConnectionTcpFull
 from telethon.sessions import StringSession
+
+# Совместимость с разными версиями Telethon: класс RPC-ошибки транспорта
+# может отсутствовать в некоторых сборках telethon.errors — импортируем
+# напрямую из lowlevel, а при неудаче обходимся без него.
+try:  # Telethon >= 1.24
+    from telethon.errors.rpcbaseerrors import RPCError  # noqa: F401
+except ImportError:  # pragma: no cover - очень старые версии
+    RPCError = None  # type: ignore[assignment]
+
+try:
+    from telethon.errors import RPCCallFailedError as _RPCCallFailedError  # type: ignore
+except ImportError:
+    try:
+        from telethon.network.connection.common import RPCCallFailedError as _RPCCallFailedError  # type: ignore
+    except ImportError:
+        _RPCCallFailedError = None  # type: ignore[assignment]
 
 from database.db import DatabaseManager
 from database.models import Account
@@ -99,7 +114,14 @@ def format_telethon_error(exc: Exception) -> str:
             "Вы заблокировали сервисный аккаунт Telegram (@SpamBot) в другом "
             "приложении — разблокируйте его и повторите."
         )
-    if isinstance(exc, (ConnectionError, OSError, SRPCallFailedError, asyncio.TimeoutError)):
+    # Собираем кортеж типов сетевых/RPC-ошибок с учётом разных версий Telethon
+    _net_exc_types: tuple[type, ...] = (ConnectionError, OSError, asyncio.TimeoutError)
+    if _RPCCallFailedError is not None:
+        _net_exc_types += (_RPCCallFailedError,)
+    if RPCError is not None:
+        _net_exc_types += (RPCError,)
+
+    if isinstance(exc, _net_exc_types):
         return (
             "Нет соединения с серверами Telegram (ошибка сети).\n\n"
             "Возможные причины:\n"
