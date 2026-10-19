@@ -11,6 +11,7 @@
 
 import asyncio
 import html
+import os
 import re
 from typing import Any, Callable, Coroutine, Optional
 
@@ -20,6 +21,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
     QDialog,
+    QFileDialog,
     QFormLayout,
     QHBoxLayout,
     QHeaderView,
@@ -194,25 +196,32 @@ class AddAccountDialog(QDialog):
         """Создание элементов диалога."""
         layout = QVBoxLayout(self)
 
-        form = QFormLayout()
-        layout.addLayout(form)
+        # --- Выбор способа добавления аккаунта ---
+        mode_form = QFormLayout()
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItem("По номеру телефона (код SMS)", "phone")
+        self.mode_combo.addItem("Импорт TData (AyuGram / Telegram Desktop)", "tdata")
+        mode_form.addRow("Способ входа:", self.mode_combo)
+        layout.addLayout(mode_form)
 
-        # Номер телефона
+        # --- Панель A: вход по номеру телефона (код + 2FA) ---
+        self.phone_panel = QWidget()
+        phone_layout = QVBoxLayout(self.phone_panel)
+        phone_layout.setContentsMargins(0, 0, 0, 0)
+
+        form = QFormLayout()
+        phone_layout.addLayout(form)
+
         self.phone_edit = QLineEdit()
         self.phone_edit.setPlaceholderText("+79991234567")
         self.phone_edit.setText("+7")
         form.addRow("Номер телефона:", self.phone_edit)
 
-        # Прокси
-        self.proxy_combo = QComboBox()
-        self.proxy_combo.addItem("Без прокси", self.NO_PROXY_ID)
-        form.addRow("Прокси:", self.proxy_combo)
-
         # Кнопка отправки кода
         self.btn_send_code = QPushButton("Отправить код")
-        layout.addWidget(self.btn_send_code)
+        phone_layout.addWidget(self.btn_send_code)
 
-        # --- Шаг 2: код и облачный пароль (скрыт до успешной отправки кода) ---
+        # Шаг 2: код и облачный пароль (скрыт до успешной отправки кода)
         self.step2_widget = QWidget()
         form2 = QFormLayout(self.step2_widget)
 
@@ -236,11 +245,11 @@ class AddAccountDialog(QDialog):
         form2.addRow(hint)
 
         self.step2_widget.setVisible(False)
-        layout.addWidget(self.step2_widget)
+        phone_layout.addWidget(self.step2_widget)
 
         self.btn_finish = QPushButton("Завершить вход")
         self.btn_finish.setEnabled(False)
-        layout.addWidget(self.btn_finish)
+        phone_layout.addWidget(self.btn_finish)
 
         # Отдельная кнопка входа сразу по облачному паролю (без SMS-кода)
         self.btn_password_login = QPushButton("Войти по облачному паролю (без SMS)")
@@ -248,7 +257,73 @@ class AddAccountDialog(QDialog):
         self.btn_password_login.setToolTip(
             "Работает, если на аккаунте включена 2FA. Код из SMS при этом не нужен."
         )
-        layout.addWidget(self.btn_password_login)
+        phone_layout.addWidget(self.btn_password_login)
+        phone_layout.addStretch(1)
+
+        layout.addWidget(self.phone_panel)
+
+        # --- Панель B: импорт TData из десктопного клиента ---
+        self.tdata_panel = QWidget()
+        tdata_layout = QVBoxLayout(self.tdata_panel)
+        tdata_layout.setContentsMargins(0, 0, 0, 0)
+
+        tform = QFormLayout()
+        tdata_layout.addLayout(tform)
+
+        # Путь к папке tdata + кнопка выбора
+        path_row = QHBoxLayout()
+        self.tdata_path_edit = QLineEdit()
+        self.tdata_path_edit.setPlaceholderText(
+            "%APPDATA%\\AyuGramDesktop\\tdata\\Work"
+        )
+        self.btn_browse_tdata = QPushButton("Обзор…")
+        path_row.addWidget(self.tdata_path_edit, 1)
+        path_row.addWidget(self.btn_browse_tdata)
+        tform.addRow("Папка tdata:", path_row)
+
+        # Аккаунты, найденные в выбранной папке
+        acc_row = QHBoxLayout()
+        self.tdata_accounts_combo = QComboBox()
+        self.tdata_accounts_combo.setToolTip(
+            "Список аккаунтов, найденных в указанной папке tdata"
+        )
+        self.btn_scan_tdata = QPushButton("Найти аккаунты")
+        acc_row.addWidget(self.tdata_accounts_combo, 1)
+        acc_row.addWidget(self.btn_scan_tdata)
+        tform.addRow("Аккаунт:", acc_row)
+
+        # Пароль локального шифрования tdata (если задавался в клиенте)
+        self.tdata_pass_edit = QLineEdit()
+        self.tdata_pass_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.tdata_pass_edit.setPlaceholderText(
+            "Только если включено локальное шифрование Two-Factor в клиенте"
+        )
+        tform.addRow("Пароль tdata (опц.):", self.tdata_pass_edit)
+
+        tdata_hint = QLabel(
+            "Как получить путь: AyuGram → Настройки → Продвинутые → «Открыть "
+            "папку с файлами» (или вручную: C:\\Users\\ВашНик\\AppData\\Roaming\\"
+            "AyuGramDesktop\\tdata). Можно указать как корневую папку tdata "
+            "(приложение сама найдёт все аккаунты), так и подпапку конкретного "
+            "аккаунта. Перед импортом рекомендуется полностью закрыть AyuGram.\n\n"
+            "Требуется пакет opentele: pip install opentele"
+        )
+        tdata_hint.setWordWrap(True)
+        tdata_hint.setStyleSheet("color: #555; font-size: 11px;")
+        tdata_layout.addWidget(tdata_hint)
+
+        self.btn_import_tdata = QPushButton("Импортировать аккаунт из TData")
+        tdata_layout.addWidget(self.btn_import_tdata)
+        tdata_layout.addStretch(1)
+
+        layout.addWidget(self.tdata_panel)
+
+        # Общий выбор прокси для обоих способов
+        proxy_form = QFormLayout()
+        self.proxy_combo = QComboBox()
+        self.proxy_combo.addItem("Без прокси", self.NO_PROXY_ID)
+        proxy_form.addRow("Прокси:", self.proxy_combo)
+        layout.addLayout(proxy_form)
 
         # Статусная строка
         self.status_label = QLabel("")
@@ -262,14 +337,35 @@ class AddAccountDialog(QDialog):
         btn_box.addWidget(self.btn_cancel)
         layout.addLayout(btn_box)
 
+        # Изначально показан способ по номеру
+        self._on_mode_changed(self.mode_combo.currentData())
+
     def _connect_signals(self) -> None:
         """Подключение кнопок."""
         self.btn_send_code.clicked.connect(self.on_send_code)
         self.btn_finish.clicked.connect(self.on_finish_login)
         self.btn_password_login.clicked.connect(self.on_password_login)
         self.btn_cancel.clicked.connect(self.reject)
+        self.mode_combo.currentIndexChanged.connect(
+            lambda _i: self._on_mode_changed(self.mode_combo.currentData())
+        )
+        self.btn_browse_tdata.clicked.connect(self.on_browse_tdata)
+        self.btn_scan_tdata.clicked.connect(self.on_scan_tdata)
+        self.btn_import_tdata.clicked.connect(self.on_import_tdata)
 
-    # ------------------------- Статусы входа -------------------------
+    # ------------------------- Режимы диалога -------------------------
+    def _on_mode_changed(self, mode: str) -> None:
+        """Переключение панелей в зависимости от выбранного способа входа."""
+        self.phone_panel.setVisible(mode == "phone")
+        self.tdata_panel.setVisible(mode == "tdata")
+        if mode == "tdata":
+            self.status_label.setText(
+                "Укажите папку tdata (или нажмите «Найти аккаунты» после "
+                "выбора пути)."
+            )
+        else:
+            self.status_label.setText("")
+
     @Slot(str)
     def _on_login_status(self, stage: str) -> None:
         """Отображение текущего этапа сетевого взаимодействия с Telegram."""
@@ -278,6 +374,8 @@ class AddAccountDialog(QDialog):
             "connected": "Соединение установлено. Отправка запроса…",
             "done": "Готово.",
             "timeout": "Серверы Telegram не отвечают (таймаут соединения).",
+            "tdata_convert": "Чтение и конвертация TData…",
+            "tdata_converted": "TData сконвертирован. Проверка сессии…",
         }
         self.status_label.setText(texts.get(stage, stage))
 
@@ -519,6 +617,118 @@ class AddAccountDialog(QDialog):
             return
 
         self._finish_login_common("", password_2fa, "password")
+
+    # ------------------------- Импорт TData (AyuGram / Telegram Desktop) -------------------------
+    @staticmethod
+    def _default_tdata_paths() -> list[str]:
+        """
+        Типичные пути к папкам tdata на Windows.
+
+        Проверяются AyuGram, iGram и официальный Telegram Desktop —
+        все они используют структуру <AppData>/<клиент>/tdata/<аккаунт>.
+
+        :return: Список существующих на машине путей (может быть пустым).
+        """
+        appdata = os.environ.get("APPDATA", "")
+        candidates = []
+        for client_dir in ("AyuGramDesktop", "iGramDesktop", "Telegram Desktop"):
+            if appdata:
+                candidates.append(os.path.join(appdata, client_dir, "tdata"))
+        return [p for p in candidates if os.path.isdir(p)]
+
+    def prefill_tdata_path(self) -> None:
+        """Автозаполнение поля пути, если tdata найден автоматически."""
+        for path in self._default_tdata_paths():
+            self.tdata_path_edit.setText(path)
+            self.on_scan_tdata()
+            return
+
+    def on_browse_tdata(self) -> None:
+        """Выбор папки tdata через системный диалог."""
+        start_dir = self.tdata_path_edit.text().strip() or ""
+        folder = QFileDialog.getExistingDirectory(
+            self, "Выберите папку tdata (или папку клиента)", start_dir
+        )
+        if folder:
+            self.tdata_path_edit.setText(folder)
+            self.on_scan_tdata()
+
+    def on_scan_tdata(self) -> None:
+        """Сканирование указанной папки и заполнение списка аккаунтов."""
+        base = self.tdata_path_edit.text().strip()
+        self.tdata_accounts_combo.clear()
+        if not base:
+            self.status_label.setText("Сначала укажите папку tdata.")
+            return
+
+        accounts = ClientManager.find_tdata_accounts(base)
+        if not accounts:
+            self.status_label.setText(
+                f"В папке «{base}» аккаунты tdata не найдены.\n"
+                "Укажите путь к папке клиента (например "
+                "%APPDATA%\\AyuGramDesktop) или к подпапке аккаунта внутри tdata."
+            )
+            return
+
+        for name, path in accounts:
+            self.tdata_accounts_combo.addItem(name, path)
+        self.status_label.setText(
+            f"Найдено аккаунтов tdata: {len(accounts)}. "
+            "Выберите аккаунт и нажмите «Импортировать»."
+        )
+
+    def on_import_tdata(self) -> None:
+        """Конвертация выбранного TData-аккаунта и сохранение в БД."""
+        tdata_path = self.tdata_accounts_combo.currentData()
+        if not tdata_path:
+            # Возможно пользователь ввёл путь вручную — используем его
+            manual = self.tdata_path_edit.text().strip()
+            if manual and os.path.isdir(manual):
+                tdata_path = manual
+            else:
+                QMessageBox.warning(
+                    self, "Нет аккаунта",
+                    "Укажите папку tdata и нажмите «Найти аккаунты», "
+                    "затем выберите аккаунт из списка.",
+                )
+                return
+
+        password = self.tdata_pass_edit.text().strip() or None
+
+        proxy_data = self.proxy_combo.currentData()
+        proxy_id = None if proxy_data == self.NO_PROXY_ID else int(proxy_data)
+
+        self.btn_import_tdata.setEnabled(False)
+        self.btn_send_code.setEnabled(False)
+        self.status_label.setText("Импорт TData: идёт конвертация…")
+
+        def on_success(account: Account) -> None:
+            """Аккаунт импортирован — закрываем диалог с успехом."""
+            self.account_added.emit(account)
+            QMessageBox.information(
+                self, "Успех",
+                f"Аккаунт импортирован из TData:\nID: {account.id}\n"
+                f"Username: @{account.username or '—'}\n"
+                f"Телефон: {account.phone or '—'}",
+            )
+            self.accept()
+
+        def on_error(err: str) -> None:
+            self.btn_import_tdata.setEnabled(True)
+            self.btn_send_code.setEnabled(True)
+            self.status_label.setText("")
+            QMessageBox.critical(self, "Ошибка импорта TData", err)
+
+        status_cb = lambda stage: self._status_bridge.status.emit(stage)  # noqa: E731
+
+        self._run_async(
+            lambda: self.client_manager.add_account_by_tdata(
+                str(tdata_path), password=password, proxy_id=proxy_id,
+                on_status=status_cb,
+            ),
+            on_success,
+            on_error,
+        )
 
 
 # ----------------------------------------------------------------------
