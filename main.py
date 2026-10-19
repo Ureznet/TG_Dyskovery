@@ -170,8 +170,6 @@ class AsyncBridge(QObject):
     результатов асинхронных операций в GUI.
     """
 
-    initialized = Signal()                 # БД и настройки готовы
-    initialization_failed = Signal(str)    # текст ошибки инициализации
     operation_failed = Signal(str)         # ошибка фоновой операции
 
     def __init__(self) -> None:
@@ -181,6 +179,7 @@ class AsyncBridge(QObject):
         self._ready = threading.Event()
         self.db: Optional[DatabaseManager] = None
         self.settings: Optional[SettingsManager] = None
+        self._init_error: Optional[str] = None
 
     # ------------------------------------------------------------------
     # Управление фоновым loop
@@ -197,27 +196,29 @@ class AsyncBridge(QObject):
         try:
             self.loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self.loop)
+            # Инициализацию выполняем синхронно (run_until_complete), чтобы к
+            # моменту set() события bridge.db/bridge.settings были готовы.
+            self.loop.run_until_complete(self._initialize())
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"Ошибка фонового asyncio-потока: {exc}")
+            self._init_error = str(exc)
+        finally:
             self._ready.set()
-            self.loop.create_task(self._initialize())
+        # После инициализации loop крутится вечно — в нём работают задачи GUI
+        try:
             self.loop.run_forever()
         except Exception as exc:  # noqa: BLE001
             logger.error(f"Ошибка фонового asyncio-потока: {exc}")
-            self.initialization_failed.emit(str(exc))
 
     async def _initialize(self) -> None:
         """Инициализация БД и настроек по умолчанию внутри asyncio loop."""
-        try:
-            self.db = DatabaseManager()
-            await self.db.initialize()
-            self.settings = SettingsManager(self.db)
-            await self.settings.initialize_defaults()
-            self.initialized.emit()
-        except Exception as exc:  # noqa: BLE001
-            logger.error(f"Ошибка инициализации подсистем: {exc}")
-            self.initialization_failed.emit(str(exc))
+        self.db = DatabaseManager()
+        await self.db.initialize()
+        self.settings = SettingsManager(self.db)
+        await self.settings.initialize_defaults()
 
     def wait_started(self, timeout: float = 10.0) -> bool:
-        """Ожидание запуска фоновой петли."""
+        """Ожидание завершения инициализации БД в фоновом потоке."""
         return self._ready.wait(timeout)
 
     def stop(self) -> None:
@@ -301,31 +302,30 @@ def main() -> int:
 
     # Фоновый asyncio loop с инициализацией БД
     bridge = AsyncBridge()
-    bridge.initialized.connect(
-        lambda: logger.info("База данных и настройки инициализированы")
-    )
-    bridge.initialization_failed.connect(
-        lambda err: logger.error(f"Инициализация не удалась: {err}")
-    )
     bridge.operation_failed.connect(
         lambda err: logger.error(f"Ошибка фоновой операции: {err}")
     )
     bridge.start()
-    if not bridge.wait_started(timeout=10.0):
-        logger.error("Не удалось запустить фоновый asyncio-поток")
+    if not bridge.wait_started(timeout=15.0):
+        logger.error("Не удалось инициализировать базу данных (таймаут 15 c)")
         return 1
-    if bridge.db is None:
-        logger.error("База данных не инициализирована")
+    if bridge._init_error is not None:
+        logger.error(f"Инициализация не удалась: {bridge._init_error}")
+        QMessageBox.critical(
+            None, "Ошибка базы данных",
+            f"Не удалось инициализировать БД:\n{bridge._init_error}",
+        )
         return 1
+    if bridge.db is None or bridge.settings is None:
+        logger.error("База данных или настройки не инициализированы")
+        return 1
+    logger.info("База данных и настройки инициализированы")
 
     # Менеджер Telethon-клиентов
     client_manager = ClientManager(bridge.db, encryption)
     logger.info("ClientManager инициализирован")
 
     # Чекер активности каналов (использует тот же мост к БД/настройкам)
-    if bridge.settings is None:  # защита типов для статических анализаторов
-        logger.error("SettingsManager не инициализирован")
-        return 1
     activity_checker = ActivityChecker(client_manager, bridge.db, bridge.settings)
     logger.info("ActivityChecker инициализирован")
 
