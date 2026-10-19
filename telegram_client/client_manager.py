@@ -26,8 +26,11 @@ from telethon.errors import (
     FloodWaitError,
     PhoneCodeExpiredError,
     PhoneCodeInvalidError,
+    PhoneNumberAppSignupForbiddenError,
     PhoneNumberBannedError,
+    PhoneNumberFloodError,
     PhoneNumberInvalidError,
+    PhoneNotOccupiedError,
     SessionPasswordNeededError,
 )
 from telethon.sessions import StringSession
@@ -67,6 +70,22 @@ def format_telethon_error(exc: Exception) -> str:
         return "Неверный формат номера телефона. Используйте международный формат, например +79991234567."
     if isinstance(exc, PhoneNumberBannedError):
         return "Этот номер заблокирован Telegram."
+    if isinstance(exc, PhoneNotOccupiedError):
+        return (
+            "Номер не зарегистрирован в Telegram. Убедитесь, что на этом номере "
+            "создан аккаунт Telegram, либо сначала зарегистрируйтесь через официальный клиент."
+        )
+    if isinstance(exc, PhoneNumberFloodError):
+        return (
+            "Слишком много запросов кода на этот номер. SMS-доставка временно "
+            "заблокирована Telegram — повторите попытку через несколько часов "
+            "или с другого IP/прокси."
+        )
+    if isinstance(exc, PhoneNumberAppSignupForbiddenError):
+        return (
+            "Telegram запрещает вход по номеру через сторонние приложения. "
+            "Попробуйте использовать прокси (лучше MTProto) или другой номер."
+        )
     if isinstance(exc, FloodWaitError):
         return f"Слишком много попыток. Повторите через {int(getattr(exc, 'seconds', 0))} сек."
     if isinstance(exc, (ApiIdInvalidError, AuthKeyDuplicatedError)):
@@ -308,13 +327,18 @@ class ClientManager:
             client = TelegramClient(session_string, api_id, api_hash, proxy=proxy_cfg)
             await client.connect()
             sent = await client.send_code_request(normalized)
+            # ВАЖНО: извлекаем строковую сессию ДО отключения клиента.
+            # При disconnect() Telethon очищает серверный nonce авторизации,
+            # и последующий sign_in на шаге 2 завершался бы ошибкой,
+            # несмотря на успешно отправленное SMS.
+            result_session = StringSession.save(client.session)
             logger.info(
                 f"Код подтверждения отправлен на номер {normalized[:3]}***{normalized[-2:]}"
             )
             return {
                 "status": "code_sent",
                 "phone_code_hash": sent.phone_code_hash or "",
-                "session_string": StringSession.string_session(client.session),
+                "session_string": result_session,
             }
         except FloodWaitError as exc:
             logger.warning(f"FloodWait при отправке кода: {exc.seconds} сек.")
