@@ -715,10 +715,31 @@ class ClientManager:
         # "0") к имени файла, т.е. для форков читает «key_datass», а для
         # официального TD — «key_datas»/«key_data1». Поэтому перебираем оба
         # базовых имени и ловим исключения на каждой итерации.
+        # Дополнительно читаем файлы ПРЯМЫМ открытием (без Storage.ReadFile),
+        # чтобы сканер работал даже при несовпадении схемы суффиксов opentele.
+        tried: set[str] = set()
+        candidates: list[tuple[str, str]] = []
         for key_file_name in ("key_data", "key_datas"):
+            for suffix in ("s", "1", "0", ""):
+                fname = key_file_name + suffix
+                if fname in tried:
+                    continue
+                tried.add(fname)
+                full = os.path.join(base_path, fname)
+                if os.path.isfile(full):
+                    candidates.append((key_file_name, full))
+
+        for key_file_name, full_path in candidates:
             try:
-                key_file = td.Storage.ReadFile(key_file_name, base_path)
-            except Exception:  # noqa: BLE001 — файла нет/битый, пробуем дальше
+                with open(full_path, "rb") as _f:
+                    raw = _f.read()
+                from PySide6.QtCore import QBuffer, QIODevice  # type: ignore
+
+                buf = QBuffer()
+                buf.setData(QByteArray(raw))
+                buf.open(QIODevice.ReadOnly)
+                key_file = td.MTPFile(buf)
+            except Exception:  # noqa: BLE001 — файл битый, пробуем дальше
                 continue
             try:
                 salt, key_encrypted, info_encrypted = QByteArray(), QByteArray(), QByteArray()
@@ -1173,8 +1194,28 @@ class ClientManager:
         :return: (корневая папка tdata, имя подпапки аккаунта или None).
         """
         path = os.path.abspath((base_path or "").strip().strip('"'))
+
+        def _is_tdata_root(p: str) -> bool:
+            """В папке p есть файлы ключей tdata (key_data/key_datas)?"""
+            return any(
+                os.path.isfile(os.path.join(p, f))
+                for f in ("key_datas", "key_data")
+            )
+
+        # 1) Сам путь — корень tdata (есть key_data*/ключи и подпапки-аккаунты)
+        if _is_tdata_root(path):
+            return path, None
+        # 2) Путь — подпапка аккаунта форка (.../tdata/<акк>/key_datas)
         if os.path.isfile(os.path.join(path, "key_datas")):
             return os.path.dirname(path), os.path.basename(path)
+        # 3) Родитель пути — корень tdata (выбрана подпапка «1», «Work» и т.п.)
+        parent = os.path.dirname(path)
+        if _is_tdata_root(parent):
+            return parent, os.path.basename(path)
+        # 4) Рядом лежит ./tdata (выбрана AppData-папка клиента)
+        sibling = os.path.join(path, "tdata")
+        if os.path.isdir(sibling) and _is_tdata_root(sibling):
+            return sibling, None
         return path, None
 
     @staticmethod
