@@ -190,6 +190,38 @@ class ClientManager:
 
         return api_id, str(api_hash).strip()
 
+    async def _get_account_credentials(self, account_id: int) -> tuple[int, str]:
+        """
+        Получение api_id/api_hash для конкретного аккаунта.
+
+        Приоритет: служебные настройки tg_api_id_acc_<id>/tg_api_hash_acc_<id>,
+        сохранённые при импорте TData (auth-ключ сессии жёстко привязан к
+        api_id того клиента, откуда импорт). Если их нет — глобальные
+        настройки/переменные окружения (get_api_credentials).
+
+        :param account_id: Идентификатор аккаунта в БД.
+        :return: Кортеж (api_id, api_hash).
+        """
+        try:
+            acc_id_raw = await self.db.get_setting(f"tg_api_id_acc_{account_id}")
+            acc_hash = await self.db.get_setting(f"tg_api_hash_acc_{account_id}")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                f"Ошибка чтения служебных API-настроек аккаунта "
+                f"id={account_id}: {exc}"
+            )
+            acc_id_raw, acc_hash = None, None
+
+        if acc_id_raw and acc_hash:
+            try:
+                return int(str(acc_id_raw).strip()), str(acc_hash).strip()
+            except ValueError:
+                logger.warning(
+                    f"Некорректные служебные API-настройки аккаунта id={account_id} — "
+                    "использую глобальные"
+                )
+        return await self.get_api_credentials()
+
     # ------------------------------------------------------------------
     # Прокси
     # ------------------------------------------------------------------
