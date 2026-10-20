@@ -707,10 +707,24 @@ class ClientManager:
         found: list[tuple[str, str]] = []
 
         def _is_tdata_dir(path: str) -> bool:
-            """Папка tdata аккаунта — содержит файл key_datas."""
-            return os.path.isdir(path) and os.path.isfile(
-                os.path.join(path, "key_datas")
+            """Папка tdata — содержит файлы ключей Telegram Desktop.
+
+            ВАЖНО (реальные структуры tdata):
+            - AyuGram / iGram / Unigram-форки: <tdata>/<аккаунт>/key_datas;
+            - ОФИЦИАЛЬНЫЙ Telegram Desktop (в т.ч. portable): файл называется
+              «key_data» (БЕЗ 's'), а подпапок аккаунтов НЕТ — все аккаунты
+              лежат в одном key_data прямо в корне tdata.
+            Поэтому проверяем оба имени; если в корневой папке tdata есть
+            key_data и нет ни одной подпапки с ключами — это тоже валидный
+            контейнер (один или несколько аккаунтов внутри key_data).
+            """
+            if not os.path.isdir(path):
+                return False
+            has_key = os.path.isfile(os.path.join(path, "key_datas")) or (
+                os.path.basename(path).lower() == "tdata"
+                and os.path.isfile(os.path.join(path, "key_data"))
             )
+            return has_key
 
         if not os.path.isdir(base):
             return found
@@ -860,6 +874,14 @@ class ClientManager:
                 for n in names
             )
 
+        # Если указана НЕ корневая папка tdata, но рядом лежит ../tdata с
+        # ключами — используем его (например, пользователь выбрал папку
+        # профиля portable-клиента вместо папки tdata внутри неё).
+        if not _has_key_file(abs_path):
+            sibling_tdata = os.path.join(os.path.dirname(abs_path), "tdata")
+            if os.path.isdir(sibling_tdata) and _has_key_file(sibling_tdata):
+                abs_path = sibling_tdata
+
         if not _has_key_file(abs_path):
             # Возможно указан AppData-папка клиента — попробуем <base>/tdata
             alt = os.path.join(abs_path, "tdata")
@@ -901,6 +923,33 @@ class ClientManager:
         except Exception as exc:  # noqa: BLE001
             logger.exception(f"Неожиданная ошибка чтения TData из {abs_path}")
             raise ClientManagerError(self._format_tdata_error(exc, bool(password))) from exc
+
+        # Если основной загрузчик не смог прочитать аккаунты (например,
+        # структура tdata отличается от ожидаемой opentele) — пробуем
+        # собственный низкоуровневый парсер key_datas/key_data. Он читает
+        # файлы так же, как Telegram Desktop, и умеет работать с форками
+        # (AyuGram/iGram), где opentele спотыкается.
+        if load_result is None:
+            _status("tdata_convert_fallback")
+            try:
+                load_result = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        self._load_tdata_manual, abs_path, password or None,
+                        account_name,
+                    ),
+                    timeout=60.0,
+                )
+            except asyncio.TimeoutError as exc:
+                raise ClientManagerError(
+                    "Резервное чтение tdata превысило таймаут (60 сек)."
+                ) from exc
+            except ClientManagerError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Ошибка резервного парсера tdata")
+                raise ClientManagerError(
+                    self._format_tdata_error(exc, bool(password))
+                ) from exc
 
         user_id: int = load_result["user_id"]
         dc_id: int = load_result["dc_id"]
@@ -1012,14 +1061,33 @@ class ClientManager:
                              аккаунта, если их несколько в tdata).
         :return: Словарь с полями: user_id, dc_id, auth_key (bytes),
                  api_id, api_hash, endpoint (ip, port), accounts_count.
+                 Возвращает None, если opentele не смог загрузить аккаунты
+                 («No account has been loaded» / «accountsCount is zero») —
+                 в этом случае вызывающий код использует резервный парсер.
         """
-        tdesk = TDesktop_cls(base_path, passcode=password)
+        try:
+            tdesk = TDesktop_cls(base_path, passcode=password)
+        except Exception as exc:  # noqa: BLE001
+            text = str(exc).lower()
+            if "no account has been loaded" in text or "accountcount is zero" in text:
+                logger.warning(
+                    f"opentele не загрузил аккаунты из {base_path} — "
+                    "используется резервный парсер tdata"
+                )
+                return None
+            raise
         if not tdesk.isLoaded():
             raise RuntimeError("TDesktop не загрузил данные из папки tdata")
 
         accounts = list(tdesk.accounts)
         if not accounts:
-            raise RuntimeError("В папке tdata не найдено ни одного аккаунта")
+            # Структура tdata не распознана opentele — передаём управление
+            # резервному парсеру вместо жёсткой ошибки.
+            logger.warning(
+                f"TDesktop вернул 0 аккаунтов для {base_path} — "
+                "используется резервный парсер tdata"
+            )
+            return None
 
         # Выбор конкретного аккаунта по имени папки, если оно указано
         account = tdesk.mainAccount or accounts[0]
