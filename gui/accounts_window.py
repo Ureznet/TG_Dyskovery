@@ -419,7 +419,9 @@ class AddAccountDialog(QDialog):
             future = self._submitter(coro_factory())  # type: ignore[misc]
         except Exception as exc:  # noqa: BLE001
             logger.error(f"Ошибка планирования задачи диалога: {exc}")
-            QTimer.singleShot(0, lambda: self._dispatch_failure(str(exc)))
+            # Снимаем обработчик, чтобы не смещалась FIFO-очередь
+            self._handlers.pop()
+            QTimer.singleShot(0, lambda t=str(exc): self._dispatch_failure(t))
             return
 
         def _done(fut: Any) -> None:
@@ -428,11 +430,23 @@ class AddAccountDialog(QDialog):
                 result = fut.result()
             except Exception as exc:  # noqa: BLE001
                 text = str(exc) or exc.__class__.__name__
+                logger.error(f"Ошибка фоновой задачи диалога: {text}")
                 QTimer.singleShot(0, lambda t=text: self._dispatch_failure(t))
                 return
             QTimer.singleShot(0, lambda r=result: self._dispatch_result(r))
 
-        future.add_done_callback(_done)
+        try:
+            future.add_done_callback(_done)
+        except Exception as exc:  # noqa: BLE001
+            # Future уже завершён/некорректен — обрабатываем сразу
+            logger.error(f"Не удалось зарегистрировать колбэк задачи: {exc}")
+            try:
+                result = future.result()
+            except Exception as task_exc:  # noqa: BLE001
+                text = str(task_exc) or task_exc.__class__.__name__
+                QTimer.singleShot(0, lambda t=text: self._dispatch_failure(t))
+            else:
+                QTimer.singleShot(0, lambda r=result: self._dispatch_result(r))
 
     @Slot(object)
     def _on_proxies_loaded(self, proxies: list) -> None:
@@ -852,6 +866,7 @@ class AccountsWindow(QWidget):
             future = self._submitter(coro_factory())  # type: ignore[misc]
         except Exception as exc:  # noqa: BLE001
             logger.error(f"Ошибка планирования задачи аккаунтов: {exc}")
+            self._handlers.pop()  # не смещаем FIFO-очередь обработчиков
             QTimer.singleShot(0, lambda t=str(exc): self._dispatch_failure(t))
             return
 
@@ -861,11 +876,22 @@ class AccountsWindow(QWidget):
                 result = fut.result()
             except Exception as exc:  # noqa: BLE001
                 text = str(exc) or exc.__class__.__name__
+                logger.error(f"Ошибка фоновой задачи аккаунтов: {text}")
                 QTimer.singleShot(0, lambda t=text: self._dispatch_failure(t))
                 return
             QTimer.singleShot(0, lambda r=result: self._dispatch_result(r))
 
-        future.add_done_callback(_done)
+        try:
+            future.add_done_callback(_done)
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"Не удалось зарегистрировать колбэк задачи: {exc}")
+            try:
+                result = future.result()
+            except Exception as task_exc:  # noqa: BLE001
+                text = str(task_exc) or task_exc.__class__.__name__
+                QTimer.singleShot(0, lambda t=text: self._dispatch_failure(t))
+            else:
+                QTimer.singleShot(0, lambda r=result: self._dispatch_result(r))
 
     @Slot(object)
     def _dispatch_result(self, result: Any) -> None:

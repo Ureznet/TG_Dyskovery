@@ -715,32 +715,45 @@ class ClientManager:
         if not os.path.isdir(base):
             return found
 
-        # Вариант 1: сам указанный путь — папка tdata аккаунта
-        if _is_tdata_dir(base) or (
-            os.path.basename(base).lower() == "tdata" and _is_tdata_dir(os.path.dirname(base))
-        ):
-            target = base if _is_tdata_dir(base) else os.path.dirname(base)
-            found.append((os.path.basename(target), target))
+        def _scan_container(container: str) -> list[tuple[str, str]]:
+            """Сканирование контейнера tdata: все подпапки с key_datas.
+
+            ВАЖНО: не останавливаемся на первой найденной — перечисляем ВСЕ
+            аккаунты (в AyuGram их может быть несколько).
+            """
+            items: list[tuple[str, str]] = []
+            try:
+                names = sorted(os.listdir(container))
+            except OSError:
+                return items
+            for name in names:
+                acc_dir = os.path.join(container, name)
+                if _is_tdata_dir(acc_dir):
+                    items.append((name, acc_dir))
+            return items
+
+        # Вариант 1: сам указанный путь — папка tdata конкретного аккаунта
+        # (содержит key_datas). Возвращаем именно её.
+        if _is_tdata_dir(base):
+            found.append((os.path.basename(base), base))
             return found
 
-        # Вариант 2: base — AppData-папка клиента: ищем <base>/tdata/*
+        # Вариант 2: base — корневая папка tdata клиента (...\\AyuGram\\tdata)
+        # либо AppData-папка клиента (<base>/tdata). Перечисляем ВСЕ аккаунты.
+        candidates: list[str] = []
+        if os.path.basename(base).lower() == "tdata":
+            candidates.append(base)
         tdata_root = os.path.join(base, "tdata")
         if os.path.isdir(tdata_root):
-            for name in sorted(os.listdir(tdata_root)):
-                acc_dir = os.path.join(tdata_root, name)
-                if _is_tdata_dir(acc_dir):
-                    found.append((name, acc_dir))
-            if found:
-                return found
-
-        # Вариант 2b: base — сама корневая папка tdata: <base>/<аккаунт>/key_datas
-        if os.path.basename(base).lower() == "tdata":
-            for name in sorted(os.listdir(base)):
-                acc_dir = os.path.join(base, name)
-                if _is_tdata_dir(acc_dir):
-                    found.append((name, acc_dir))
-            if found:
-                return found
+            candidates.append(tdata_root)
+        for container in candidates:
+            found.extend(_scan_container(container))
+        if found:
+            # Убираем дубликаты путей (listdir отсортирован — порядок стабилен)
+            unique: dict[str, tuple[str, str]] = {}
+            for name, path in found:
+                unique[os.path.normcase(os.path.abspath(path))] = (name, path)
+            return [v for _, v in sorted(unique.items(), key=lambda kv: kv[0])]
 
         # Вариант 3: рекурсивный поиск папок tdata (ограниченная глубина)
         try:
@@ -811,8 +824,12 @@ class ClientManager:
                 "Проверить установку: python -c \"from opentele.td import TDesktop\""
             ) from exc
 
-        # 2. Валидация пути. opentele читает КОРНЕВУЮ папку tdata клиента
-        # (в ней лежат файлы key_data / data), а не подпапку аккаунта.
+        # 2. Валидация пути. opentele умеет читать два варианта расположения:
+        #    a) корневая папка tdata (...\\Telegram\\tdata) — при импорте из GUI
+        #       мы передаём сюда КОНКРЕТНУЮ подпапку аккаунта;
+        #    b) сама подпапка аккаунта с key_datas — тоже поддерживается:
+        #       родительская папка tdata используется как base для TDesktop,
+        #       а нужный аккаунт выбирается по индексу после загрузки.
         abs_path = os.path.abspath((tdata_path or "").strip().strip('"'))
         if not os.path.isdir(abs_path):
             raise ClientManagerError(
@@ -820,6 +837,16 @@ class ClientManager:
                 "Нужно указать КОРНЕВУЮ папку tdata, например:\n"
                 "C:\\Users\\ВашНик\\AppData\\Roaming\\AyuGramDesktop\\tdata"
             )
+
+        def _is_account_dir(path: str) -> bool:
+            """Папка конкретного аккаунта tdata (содержит key_datas)."""
+            return os.path.isfile(os.path.join(path, "key_datas"))
+
+        account_name: Optional[str] = None
+        if _is_account_dir(abs_path):
+            # Указана подпапка аккаунта -> base = родительская папка tdata
+            account_name = os.path.basename(abs_path)
+            abs_path = os.path.dirname(abs_path)
 
         def _has_key_file(path: str) -> bool:
             """Есть ли в папке файлы ключей tdata (key_data / key_datas / data)."""
@@ -838,8 +865,6 @@ class ClientManager:
             alt = os.path.join(abs_path, "tdata")
             if os.path.isdir(alt) and _has_key_file(alt):
                 abs_path = alt
-            elif os.path.isfile(os.path.join(abs_path, "key_datas")):
-                pass  # старый формат layout — попробуем прочитать как есть
             else:
                 raise ClientManagerError(
                     f"В папке {abs_path} нет файлов ключей Telegram Desktop "
@@ -860,7 +885,8 @@ class ClientManager:
         try:
             load_result = await asyncio.wait_for(
                 asyncio.to_thread(
-                    self._load_tdata_account, TDesktop, abs_path, password or None
+                    self._load_tdata_account, TDesktop, abs_path,
+                    password or None, account_name,
                 ),
                 timeout=90.0,
             )
@@ -972,6 +998,7 @@ class ClientManager:
         TDesktop_cls: Any,
         base_path: str,
         password: Optional[str],
+        account_name: Optional[str] = None,
     ) -> dict[str, Any]:
         """
         Чтение корневой папки tdata и извлечение данных авторизации.
@@ -981,6 +1008,8 @@ class ClientManager:
         :param TDesktop_cls: Класс opentele.td.TDesktop.
         :param base_path: Корневая папка tdata.
         :param password: Локальный пароль tdata (passcode), если задан.
+        :param account_name: Имя подпапки аккаунта (для выбора конкретного
+                             аккаунта, если их несколько в tdata).
         :return: Словарь с полями: user_id, dc_id, auth_key (bytes),
                  api_id, api_hash, endpoint (ip, port), accounts_count.
         """
@@ -992,7 +1021,20 @@ class ClientManager:
         if not accounts:
             raise RuntimeError("В папке tdata не найдено ни одного аккаунта")
 
+        # Выбор конкретного аккаунта по имени папки, если оно указано
         account = tdesk.mainAccount or accounts[0]
+        if account_name:
+            target_dir = os.path.normcase(os.path.abspath(account_name))
+            matched = None
+            for acc in accounts:
+                acc_path = getattr(acc, "accountPath", None)
+                if acc_path and os.path.normcase(
+                    os.path.abspath(str(acc_path))
+                ) == target_dir:
+                    matched = acc
+                    break
+            if matched is not None:
+                account = matched
         auth_key_obj = account.authKey
         if auth_key_obj is None:
             raise RuntimeError(
