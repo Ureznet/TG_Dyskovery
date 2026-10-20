@@ -685,9 +685,12 @@ class AddAccountDialog(QDialog):
             return
 
         for name, path in accounts:
+            # data — ПУТЬ К КОНТЕЙНЕРУ tdata целиком (не к подпапке):
+            # opentele читает key_datas из корня; выбор конкретного
+            # аккаунта выполняется по имени подпапки ("Аккаунт 3" -> 3).
             self.tdata_accounts_combo.addItem(name, path)
         self.status_label.setText(
-            f"Найдено аккаунтов tdata: {len(accounts)}. "
+            f"Найдено контейнеров tdata: {len(accounts)}. "
             "Выберите аккаунт и нажмите «Импортировать»."
         )
 
@@ -709,6 +712,15 @@ class AddAccountDialog(QDialog):
 
         password = self.tdata_pass_edit.text().strip() or None
 
+        # Имя выбранного аккаунта -> индекс подпапки для импорта из общего
+        # контейнера key_datas ("Аккаунт 3" -> "3", "Work" -> "Work")
+        acc_label = str(self.tdata_accounts_combo.currentText() or "").strip()
+        account_name: Optional[str] = None
+        if acc_label.startswith("Аккаунт "):
+            account_name = acc_label.replace("Аккаунт ", "").strip() or None
+        elif acc_label and not acc_label.startswith("Telegram Desktop"):
+            account_name = acc_label
+
         proxy_data = self.proxy_combo.currentData()
         proxy_id = None if proxy_data == self.NO_PROXY_ID else int(proxy_data)
 
@@ -719,18 +731,25 @@ class AddAccountDialog(QDialog):
         def on_success(account: Account) -> None:
             """Аккаунт импортирован — закрываем диалог с успехом."""
             self.account_added.emit(account)
-            QMessageBox.information(
-                self, "Успех",
+            warning = getattr(account, "_verify_warning", None)
+            msg = (
                 f"Аккаунт импортирован из TData:\nID: {account.id}\n"
                 f"Username: @{account.username or '—'}\n"
-                f"Телефон: {account.phone or '—'}",
+                f"Телефон: {account.phone or '—'}"
             )
+            if warning:
+                QMessageBox.information(
+                    self, "Импорт завершён (с предупреждением)",
+                    msg + f"\n\n⚠ {warning}",
+                )
+            else:
+                QMessageBox.information(self, "Успех", msg)
             self.accept()
 
         def on_error(err: str) -> None:
             self.btn_import_tdata.setEnabled(True)
             self.btn_send_code.setEnabled(True)
-            self.status_label.setText("")
+            self.status_label.setText("Ошибка импорта. См. окно ошибки.")
             QMessageBox.critical(self, "Ошибка импорта TData", err)
 
         status_cb = lambda stage: self._status_bridge.status.emit(stage)  # noqa: E731
@@ -738,7 +757,7 @@ class AddAccountDialog(QDialog):
         self._run_async(
             lambda: self.client_manager.add_account_by_tdata(
                 str(tdata_path), password=password, proxy_id=proxy_id,
-                on_status=status_cb,
+                on_status=status_cb, account_name=account_name,
             ),
             on_success,
             on_error,

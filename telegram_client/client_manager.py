@@ -692,105 +692,125 @@ class ClientManager:
     # Добавление аккаунта: импорт TData (Unigram/AyuGram/Telegram Desktop)
     # ------------------------------------------------------------------
     @staticmethod
+    def _read_tdata_accounts_count(
+        base_path: str, password: Optional[str]
+    ) -> int:
+        """
+        Подсчёт реально загружаемых аккаунтов в контейнере tdata.
+
+        Читает заголовок key_data/key_datas БЕЗ полной расшифровки:
+        localKey извлекается из key*-файла (при наличии passcode — через
+        PBKDF2), затем расшифровывается список индексов аккаунтов.
+
+        :param base_path: Корневая папка tdata.
+        :param password: Локальный пароль (passcode), если задан.
+        :return: Число аккаунтов в контейнере; 0 — если прочитать не удалось.
+        """
+        try:
+            from PySide6.QtCore import QByteArray  # type: ignore
+            from opentele import td  # type: ignore
+        except ImportError:
+            return 0
+        try:
+            key_file = td.Storage.ReadFile("key_data", base_path)
+            salt, key_encrypted, info_encrypted = QByteArray(), QByteArray(), QByteArray()
+            key_file.stream >> salt >> key_encrypted >> info_encrypted
+            pass_bytes = (password or "").encode("ascii")
+            local = td.Storage.CreateLocalKey(salt, QByteArray(pass_bytes))
+            inner = td.Storage.DecryptLocal(key_encrypted, local)
+            auth_key = td.AuthKey(inner.stream.readRawData(256))
+            info = td.Storage.DecryptLocal(info_encrypted, auth_key)
+            count = info.stream.readInt32()
+            return max(0, int(count))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"Не удалось посчитать аккаунты в {base_path}: {exc}")
+            return 0
+
+    @staticmethod
     def find_tdata_accounts(base_path: str) -> list[tuple[str, str]]:
         """
-        Поиск папок tdata с аккаунтами внутри указанного пути.
+        Поиск аккаунтов tdata внутри указанного пути.
 
-        Структура профиля Unigram-клиентов (Telegram Desktop, AyuGram, iGram):
-        <профиль>/tdata/<имя_аккаунта>/{key_datas, map, ...}
+        Поддерживаемые структуры:
+        - AyuGram/iGram/Unigram-форки: <tdata>/<аккаунт>/key_datas —
+          каждый аккаунт лежит в отдельной ПОДПАПКЕ (их может быть много);
+        - официальный Telegram Desktop (в т.ч. portable): один файл
+          «key_data» в корне tdata, внутри которого может храниться
+          НЕСКОЛЬКО аккаунтов (подпапок нет).
 
-        :param base_path: Путь к папке с tdata ЛИБО к AppData-папке клиента
-                          (например C:\\Users\\You\\AppData\\Roaming\\AyuGramDesktop).
-        :return: Список пар (имя аккаунта, путь к папке tdata аккаунта).
+        :param base_path: Путь к папке tdata ИЛИ к AppData-папке клиента.
+        :return: Список троек (отображаемое имя, путь к контейнеру tdata,
+                 тип контейнера: "folder" — подпапка аккаунта,
+                 "file" — единый key_data с несколькими аккаунтами).
         """
         base = os.path.abspath((base_path or "").strip().strip('"'))
-        found: list[tuple[str, str]] = []
-
-        def _is_tdata_dir(path: str) -> bool:
-            """Папка tdata — содержит файлы ключей Telegram Desktop.
-
-            ВАЖНО (реальные структуры tdata):
-            - AyuGram / iGram / Unigram-форки: <tdata>/<аккаунт>/key_datas;
-            - ОФИЦИАЛЬНЫЙ Telegram Desktop (в т.ч. portable): файл называется
-              «key_data» (БЕЗ 's'), а подпапок аккаунтов НЕТ — все аккаунты
-              лежат в одном key_data прямо в корне tdata.
-            Поэтому проверяем оба имени; если в корневой папке tdata есть
-            key_data и нет ни одной подпапки с ключами — это тоже валидный
-            контейнер (один или несколько аккаунтов внутри key_data).
-            """
-            if not os.path.isdir(path):
-                return False
-            has_key = os.path.isfile(os.path.join(path, "key_datas")) or (
-                os.path.basename(path).lower() == "tdata"
-                and os.path.isfile(os.path.join(path, "key_data"))
-            )
-            return has_key
-
         if not os.path.isdir(base):
-            return found
+            return []
 
-        def _scan_container(container: str) -> list[tuple[str, str]]:
-            """Сканирование контейнера tdata: все подпапки с key_datas.
+        def _has_key_datas(path: str) -> bool:
+            """Папка конкретного аккаунта форка (содержит key_datas)."""
+            return os.path.isfile(os.path.join(path, "key_datas"))
 
-            ВАЖНО: не останавливаемся на первой найденной — перечисляем ВСЕ
-            аккаунты (в AyuGram их может быть несколько).
+        def _is_key_data_root(path: str) -> bool:
+            """Контейнер официального TD: файл key_data прямо в папке."""
+            return os.path.isfile(os.path.join(path, "key_data"))
+
+        def _scan_container(container: str) -> list[tuple[str, str, str]]:
+            """Перечисляет ВСЕ подпапки-аккаунты контейнера tdata.
+
+            ВАЖНО: AyuGram хранит подпапки аккаунтов с ЧИСЛОВЫМИ именами
+            ("1", "2", "3", "4"), а не с именами пользователей — имена из
+            listdir и есть отображаемые метки («Аккаунт 1» ... «Аккаунт 4»).
             """
-            items: list[tuple[str, str]] = []
+            items: list[tuple[str, str, str]] = []
             try:
-                names = sorted(os.listdir(container))
+                names = sorted(
+                    os.listdir(container),
+                    key=lambda n: (0, int(n)) if n.isdigit() else (1, n.lower()),
+                )
             except OSError:
                 return items
             for name in names:
                 acc_dir = os.path.join(container, name)
-                if _is_tdata_dir(acc_dir):
-                    items.append((name, acc_dir))
+                if os.path.isdir(acc_dir) and _has_key_datas(acc_dir):
+                    label = f"Аккаунт {name}" if name.isdigit() else name
+                    items.append((label, acc_dir, "folder"))
             return items
 
-        # Вариант 1: сам указанный путь — папка tdata конкретного аккаунта
-        # (содержит key_datas). Возвращаем именно её.
-        if _is_tdata_dir(base):
-            found.append((os.path.basename(base), base))
-            return found
+        results: list[tuple[str, str, str]] = []
 
-        # Вариант 2: base — корневая папка tdata клиента (...\\AyuGram\\tdata)
-        # либо AppData-папка клиента (<base>/tdata). Перечисляем ВСЕ аккаунты.
-        candidates: list[str] = []
-        if os.path.basename(base).lower() == "tdata":
-            candidates.append(base)
-        tdata_root = os.path.join(base, "tdata")
-        if os.path.isdir(tdata_root):
-            candidates.append(tdata_root)
-        for container in candidates:
-            found.extend(_scan_container(container))
-        if found:
-            # Убираем дубликаты путей (listdir отсортирован — порядок стабилен)
-            unique: dict[str, tuple[str, str]] = {}
-            for name, path in found:
-                unique[os.path.normcase(os.path.abspath(path))] = (name, path)
-            return [v for _, v in sorted(unique.items(), key=lambda kv: kv[0])]
+        # Вариант 1: указан путь профиля portable-клиента (рядом лежит tdata)
+        if not _has_key_datas(base) and not _is_key_data_root(base):
+            sibling_tdata = os.path.join(os.path.dirname(base), "tdata")
+            if os.path.isdir(sibling_tdata):
+                base = sibling_tdata
 
-        # Вариант 3: рекурсивный поиск папок tdata (ограниченная глубина)
-        try:
-            for root, dirs, _files in os.walk(base):
-                # Не спускаемся в глубокие системные каталоги
-                depth = os.path.relpath(root, base).count(os.sep)
-                if depth > 4:
-                    dirs.clear()
-                    continue
-                for d in list(dirs):
-                    if d.lower() == "tdata":
-                        td_path = os.path.join(root, d)
-                        for name in sorted(os.listdir(td_path)):
-                            acc_dir = os.path.join(td_path, name)
-                            if _is_tdata_dir(acc_dir):
-                                found.append((name, acc_dir))
-                        dirs.remove(d)
-                if found:
-                    break
-        except OSError as exc:
-            logger.warning(f"Ошибка сканирования {base}: {exc}")
+        # Вариант 2: base — корневая папка tdata форка: подпапки-аккаунты
+        sub_dirs = _scan_container(base)
+        if sub_dirs:
+            results.extend(sub_dirs)
 
-        return found
+        # Вариант 3: base — AppData-папка клиента (.../AyuGramDesktop)
+        if not results:
+            tdata_root = os.path.join(base, "tdata")
+            if os.path.isdir(tdata_root):
+                results.extend(_scan_container(tdata_root))
+                if _is_key_data_root(tdata_root):
+                    n = ClientManager._read_tdata_accounts_count(tdata_root, None)
+                    label = f"Telegram Desktop ({n} акк.)" if n > 1 else "Telegram Desktop"
+                    results.append((label, tdata_root, "file"))
+
+        # Вариант 4: base сама является контейнером key_data (portable TD)
+        if not results and _is_key_data_root(base):
+            n = ClientManager._read_tdata_accounts_count(base, None)
+            label = f"{os.path.basename(base)} ({n} акк.)" if n > 1 else os.path.basename(base)
+            results.append((label, base, "file"))
+
+        # Дедупликация по нормализованному пути
+        unique: dict[str, tuple[str, str, str]] = {}
+        for name, path, kind in results:
+            unique[os.path.normcase(os.path.abspath(path))] = (name, path, kind)
+        return sorted(unique.values(), key=lambda item: item[0].lower())
 
     async def add_account_by_tdata(
         self,
@@ -798,6 +818,7 @@ class ClientManager:
         password: Optional[str] = None,
         proxy_id: Optional[int] = None,
         on_status: Optional[Callable[[str], None]] = None,
+        account_name: Optional[str] = None,
     ) -> Account:
         """
         Добавление аккаунта конвертацией TData-сессии десктопного клиента.
@@ -856,10 +877,10 @@ class ClientManager:
             """Папка конкретного аккаунта tdata (содержит key_datas)."""
             return os.path.isfile(os.path.join(path, "key_datas"))
 
-        account_name: Optional[str] = None
         if _is_account_dir(abs_path):
-            # Указана подпапка аккаунта -> base = родительская папка tdata
-            account_name = os.path.basename(abs_path)
+            # Указана подпапка аккаунта -> base = родительская папка tdata;
+            # имя подпапки используется для выбора аккаунта внутри контейнера
+            account_name = account_name or os.path.basename(abs_path)
             abs_path = os.path.dirname(abs_path)
 
         def _has_key_file(path: str) -> bool:
@@ -1043,6 +1064,22 @@ class ClientManager:
     # Вспомогательные методы импорта TData
     # ------------------------------------------------------------------
     @staticmethod
+    def _tdata_root_for(base_path: str) -> tuple[str, Optional[str]]:
+        """
+        Определение КОРНЕВОЙ папки tdata и имени подпапки-аккаунта.
+
+        opentele.TDesktop принимает именно корневую папку tdata (в ней лежат
+        key_data/key_datas). Если пользователь выбрал подпапку конкретного
+        аккаунта форка (...\\tdata\\Work) — поднимаемся на уровень выше.
+
+        :return: (корневая папка tdata, имя подпапки аккаунта или None).
+        """
+        path = os.path.abspath((base_path or "").strip().strip('"'))
+        if os.path.isfile(os.path.join(path, "key_datas")):
+            return os.path.dirname(path), os.path.basename(path)
+        return path, None
+
+    @staticmethod
     def _load_tdata_account(
         TDesktop_cls: Any,
         base_path: str,
@@ -1055,83 +1092,270 @@ class ClientManager:
         Выполняется в отдельном потоке (синхронный CPU/disk код opentele).
 
         :param TDesktop_cls: Класс opentele.td.TDesktop.
-        :param base_path: Корневая папка tdata.
+        :param base_path: Корневая папка tdata ИЛИ подпапка аккаунта форка
+                          (путь нормализуется автоматически).
         :param password: Локальный пароль tdata (passcode), если задан.
         :param account_name: Имя подпапки аккаунта (для выбора конкретного
                              аккаунта, если их несколько в tdata).
         :return: Словарь с полями: user_id, dc_id, auth_key (bytes),
-                 api_id, api_hash, endpoint (ip, port), accounts_count.
+                 api_id, api_hash, endpoint (ip, port), accounts_count,
+                 index (индекс выбранного аккаунта в контейнере).
                  Возвращает None, если opentele не смог загрузить аккаунты
                  («No account has been loaded» / «accountsCount is zero») —
                  в этом случае вызывающий код использует резервный парсер.
         """
-        try:
-            tdesk = TDesktop_cls(base_path, passcode=password)
-        except Exception as exc:  # noqa: BLE001
-            text = str(exc).lower()
-            if "no account has been loaded" in text or "accountcount is zero" in text:
-                logger.warning(
-                    f"opentele не загрузил аккаунты из {base_path} — "
-                    "используется резервный парсер tdata"
+        root, sub_name = ClientManager._tdata_root_for(base_path)
+        target_name = account_name or sub_name
+
+        last_exc: Optional[Exception] = None
+        for key_file in ("data", "datas"):
+            try:
+                tdesk = TDesktop_cls(root, passcode=password, keyFile=key_file)
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                text = str(exc).lower()
+                if "could not open" in text or "invalid magic" in text \
+                        or "not found" in text or "no file" in text:
+                    # Файл ключей с таким именем отсутствует — пробуем другой
+                    continue
+                if "no account has been loaded" in text or "accountcount is zero" in text:
+                    logger.warning(
+                        f"opentele не загрузил аккаунты из {root} "
+                        f"(key_{key_file}) — пробуем альтернативный файл ключей"
+                    )
+                    continue
+                raise
+            if not tdesk.isLoaded():
+                last_exc = RuntimeError("TDesktop не загрузил данные из папки tdata")
+                continue
+
+            accounts = list(tdesk.accounts)
+            if not accounts:
+                last_exc = RuntimeError("TDesktop вернул 0 аккаунтов")
+                continue
+
+            # Выбор конкретного аккаунта по индексу подпапки (форки AyuGram:
+            # индекс папки == индекс аккаунта внутри key_datas)
+            account = tdesk.mainAccount or accounts[0]
+            chosen_index = accounts.index(account) if account in accounts else 0
+            if target_name and target_name.isdigit():
+                idx = int(target_name) - 1  # имена вида "1", "2" — 1-индексные
+                if 0 <= idx < len(accounts):
+                    account = accounts[idx]
+                    chosen_index = idx
+            auth_key_obj = account.authKey
+            if auth_key_obj is None:
+                raise RuntimeError(
+                    "Аккаунт в tdata не авторизован (пустой auth_key). "
+                    "Откройте AyuGram и убедитесь, что аккаунт активен."
                 )
-                return None
-            raise
-        if not tdesk.isLoaded():
-            raise RuntimeError("TDesktop не загрузил данные из папки tdata")
 
-        accounts = list(tdesk.accounts)
-        if not accounts:
-            # Структура tdata не распознана opentele — передаём управление
-            # резервному парсеру вместо жёсткой ошибки.
-            logger.warning(
-                f"TDesktop вернул 0 аккаунтов для {base_path} — "
-                "используется резервный парсер tdata"
-            )
+            # Endpoint ДЦ из конфигурации, сохранённой в tdata
+            from opentele.td import MTP  # type: ignore
+
+            endpoints = account._local.config.endpoints(account.MainDcId)
+            ipv4_tcp = endpoints[MTP.DcOptions.Address.IPv4][MTP.DcOptions.Protocol.Tcp]
+            if not ipv4_tcp:
+                raise RuntimeError(
+                    "В конфиге tdata не найдено IPv4 TCP-эндпоинтов для ДЦ "
+                    f"{int(account.MainDcId)}"
+                )
+            endpoint = ipv4_tcp[0]
+
+            api_data = account.api
+            return {
+                "user_id": int(account.UserId),
+                "dc_id": int(account.MainDcId),
+                "auth_key": bytes(auth_key_obj.key)[:192],
+                "api_id": int(getattr(api_data, "api_id", 0)),
+                "api_hash": str(getattr(api_data, "api_hash", "") or ""),
+                "endpoint": (str(endpoint.ip), int(endpoint.port)),
+                "accounts_count": len(accounts),
+                "index": chosen_index,
+            }
+
+        # Ни один вариант файла ключей не подошёл — сигнал резервному парсеру
+        logger.warning(
+            f"Не удалось прочитать tdata через opentele ({root}): {last_exc}"
+        )
+        return None
+
+    @staticmethod
+    def _load_tdata_manual(
+        base_path: str,
+        password: Optional[str],
+        account_name: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """
+        Резервное чтение tdata БЕЗ полной загрузки аккаунтов opentele.
+
+        Используется, когда opentele не распознаёт структуру (например,
+        файлы форков с нестандартным содержимым). Читает localKey из
+        key_data/key_datas и расшифровывает mtpauthorization нужного
+        аккаунта напрямую (тот же формат, что у Telegram Desktop).
+
+        :return: Словарь как у _load_tdata_account.
+        :raises ClientManagerError: Если прочитать/расшифровать не удалось.
+        """
+        try:
+            from PySide6.QtCore import QByteArray  # type: ignore
+            from opentele import td  # type: ignore
+        except ImportError as exc:
+            raise ClientManagerError(
+                "Для импорта TData необходим пакет opentele:\n"
+                "    pip install opentele"
+            ) from exc
+
+        root, sub_name = ClientManager._tdata_root_for(base_path)
+        target_name = account_name or sub_name
+
+        last_err: Optional[str] = None
+        for key_file in ("key_data", "key_datas"):
+            full = os.path.join(root, key_file)
+            if not os.path.isfile(full):
+                continue
+            try:
+                desc = td.Storage.ReadFile(key_file.replace("key_", "key_"), root)
+            except Exception as exc:  # noqa: BLE001
+                last_err = str(exc)
+                continue
+            try:
+                salt, key_encrypted, info_encrypted = QByteArray(), QByteArray(), QByteArray()
+                desc.stream >> salt >> key_encrypted >> info_encrypted
+                pass_bytes = (password or "").encode("ascii")
+                local = td.Storage.CreateLocalKey(salt, QByteArray(pass_bytes))
+                inner = td.Storage.DecryptLocal(key_encrypted, local)
+                auth_key_obj = td.AuthKey(inner.stream.readRawData(256))
+                info = td.Storage.DecryptLocal(info_encrypted, auth_key_obj)
+                count = info.stream.readInt32()
+                indexes = [info.stream.readInt32() for _ in range(max(0, count))]
+            except Exception as exc:  # noqa: BLE001
+                text = str(exc).lower()
+                if "decrypt" in text or "bad" in text or "magic" in text:
+                    raise ClientManagerError(
+                        "Не удалось расшифровать tdata. Если в клиенте включён "
+                        "локальный пароль (Local Passcode) — введите его в поле "
+                        "«Пароль tdata»."
+                    ) from exc
+                last_err = str(exc)
+                continue
+
+            if not indexes:
+                last_err = "список аккаунтов пуст"
+                continue
+
+            # Индекс целевого аккаунта: имя подпапки ("2" -> индекс 1)
+            target_index = indexes[0]
+            if target_name and str(target_name).isdigit():
+                want = int(target_name) - 1
+                if want in indexes:
+                    target_index = want
+
+            try:
+                acc_desc = td.Storage.ReadFile(f"{target_index}", root)
+                serialized = td.Storage.DecryptLocal(acc_desc.encrypted, auth_key_obj)
+            except ClientManagerError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                raise ClientManagerError(
+                    f"Не удалось прочитать данные аккаунта №{target_index + 1} "
+                    f"из tdata: {exc}"
+                ) from exc
+
+            parsed = ClientManager._parse_mtp_authorization(serialized.data())
+            if parsed is None:
+                last_err = "не удалось разобрать mtpauthorization"
+                continue
+            parsed["accounts_count"] = len(indexes)
+            parsed["index"] = target_index
+            return parsed
+
+        raise ClientManagerError(
+            "Резервный парсер не смог прочитать tdata.\n\n"
+            f"Причина: {last_err or 'файлы ключей не найдены'}\n\n"
+            "Проверьте, что указана папка tdata (а не её родитель), и что "
+            "клиент полностью закрыт."
+        )
+
+    @staticmethod
+    def _parse_mtp_authorization(raw: bytes) -> Optional[dict[str, Any]]:
+        """
+        Разбор сериализованной структуры mtpauthorization Telegram Desktop.
+
+        Формат (Qt QDataStream, little endian):
+          int32 user_id | int32 dc_id | (расширенный 64-бит заголовок опц.)
+          ... список auth-ключей DC ...
+
+        :param raw: Расшифрованные байты блока аккаунта.
+        :return: Словарь с user_id/dc_id/auth_key или None при ошибке.
+        """
+        import struct as _struct
+
+        if len(raw) < 8:
             return None
+        try:
+            pos = 0
 
-        # Выбор конкретного аккаунта по имени папки, если оно указано
-        account = tdesk.mainAccount or accounts[0]
-        if account_name:
-            target_dir = os.path.normcase(os.path.abspath(account_name))
-            matched = None
-            for acc in accounts:
-                acc_path = getattr(acc, "accountPath", None)
-                if acc_path and os.path.normcase(
-                    os.path.abspath(str(acc_path))
-                ) == target_dir:
-                    matched = acc
-                    break
-            if matched is not None:
-                account = matched
-        auth_key_obj = account.authKey
-        if auth_key_obj is None:
-            raise RuntimeError(
-                "Аккаунт в tdata не авторизован (пустой auth_key). "
-                "Откройте AyuGram и убедитесь, что аккаунт активен."
-            )
+            def i32() -> int:
+                nonlocal pos
+                val = _struct.unpack_from("<i", raw, pos)[0]
+                pos += 4
+                return val
 
-        # Endpoint ДЦ из конфигурации, сохранённой в tdata
-        from opentele.td import MTP  # type: ignore
+            def i64() -> int:
+                nonlocal pos
+                val = _struct.unpack_from("<q", raw, pos)[0]
+                pos += 8
+                return val
 
-        endpoints = account._local.config.endpoints(account.MainDcId)
-        ipv4_tcp = endpoints[MTP.DcOptions.Address.IPv4][MTP.DcOptions.Protocol.Tcp]
-        if not ipv4_tcp:
-            raise RuntimeError(
-                "В конфиге tdata не найдено IPv4 TCP-эндпоинтов для ДЦ "
-                f"{int(account.MainDcId)}"
-            )
-        endpoint = ipv4_tcp[0]
+            user_id = i32()
+            dc_id = i32()
+            if ((user_id << 32) | (dc_id & 0xFFFFFFFF)) == -2:
+                # Признак широкого формата id — перечитываем
+                pos = 0
+                _ = i32()
+                _ = i32()
+                user_id = i64()
+                dc_id = i32()
 
-        api_data = account.api
-        return {
-            "user_id": int(account.UserId),
-            "dc_id": int(account.MainDcId),
-            "auth_key": bytes(auth_key_obj.key)[:192],
-            "api_id": int(getattr(api_data, "api_id", 0)),
-            "api_hash": str(getattr(api_data, "api_hash", "") or ""),
-            "endpoint": (str(endpoint.ip), int(endpoint.port)),
-            "accounts_count": len(accounts),
-        }
+            # Поиск 256-байтового auth-ключа основного ДЦ: структура ключа
+            # в TD сериализуется как [len(int32)][key bytes][dcId][userId]...
+            # Надёжнее всего перебрать блоки длиной 256.
+            auth_key: Optional[bytes] = None
+            while pos + 4 <= len(raw):
+                size = i32()
+                if size == 256 and pos + 256 <= len(raw):
+                    candidate = raw[pos:pos + 256]
+                    pos += 256
+                    # После ключа идут int32 dc_id и int64/uint32 user_id
+                    try:
+                        k_dc = i32()
+                        k_user = i32()
+                        if ((k_user << 32) | (k_dc & 0xFFFFFFFF)) == -2:
+                            pos -= 4
+                            k_user = i64()
+                            k_dc = i32()
+                    except Exception:
+                        break
+                    if k_dc == dc_id and (k_user == user_id or k_user == 0):
+                        auth_key = candidate
+                        break
+                    pos -= 8
+                    continue
+                pos += max(0, size)
+            if auth_key is None:
+                return None
+            return {
+                "user_id": int(user_id),
+                "dc_id": int(dc_id),
+                "auth_key": auth_key[:192],
+                "api_id": 0,
+                "api_hash": "",
+                "endpoint": ("", 0),
+            }
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"Ошибка разбора mtpauthorization: {exc}")
+            return None
 
     @staticmethod
     def _format_tdata_error(exc: Exception, had_password: bool) -> str:
