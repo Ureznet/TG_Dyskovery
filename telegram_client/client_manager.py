@@ -711,105 +711,185 @@ class ClientManager:
             from opentele import td  # type: ignore
         except ImportError:
             return 0
-        try:
-            key_file = td.Storage.ReadFile("key_data", base_path)
-            salt, key_encrypted, info_encrypted = QByteArray(), QByteArray(), QByteArray()
-            key_file.stream >> salt >> key_encrypted >> info_encrypted
-            pass_bytes = (password or "").encode("ascii")
-            local = td.Storage.CreateLocalKey(salt, QByteArray(pass_bytes))
-            inner = td.Storage.DecryptLocal(key_encrypted, local)
-            auth_key = td.AuthKey(inner.stream.readRawData(256))
-            info = td.Storage.DecryptLocal(info_encrypted, auth_key)
-            count = info.stream.readInt32()
-            return max(0, int(count))
-        except Exception as exc:  # noqa: BLE001
-            logger.debug(f"Не удалось посчитать аккаунты в {base_path}: {exc}")
-            return 0
+        # ВАЖНО: opentele.Storage.ReadFile сам добавляет суффиксы ("s", "1",
+        # "0") к имени файла, т.е. для форков читает «key_datass», а для
+        # официального TD — «key_datas»/«key_data1». Поэтому перебираем оба
+        # базовых имени и ловим исключения на каждой итерации.
+        for key_file_name in ("key_data", "key_datas"):
+            try:
+                key_file = td.Storage.ReadFile(key_file_name, base_path)
+            except Exception:  # noqa: BLE001 — файла нет/битый, пробуем дальше
+                continue
+            try:
+                salt, key_encrypted, info_encrypted = QByteArray(), QByteArray(), QByteArray()
+                key_file.stream >> salt >> key_encrypted >> info_encrypted
+                pass_bytes = (password or "").encode("ascii")
+                local = td.Storage.CreateLocalKey(salt, QByteArray(pass_bytes))
+                inner = td.Storage.DecryptLocal(key_encrypted, local)
+                auth_key = td.AuthKey(inner.stream.readRawData(256))
+                info = td.Storage.DecryptLocal(info_encrypted, auth_key)
+                count = info.stream.readInt32()
+                if count > 0:
+                    return int(count)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    f"Не удалось посчитать аккаунты в {base_path} "
+                    f"({key_file_name}): {exc}"
+                )
+        return 0
 
     @staticmethod
+    def _list_account_subdirs(container: str) -> list[str]:
+        """Имена подпапок-аккаунтов контейнера tdata.
+
+        Telethon-структура форков (AyuGram/iGram): внутри tdata лежат
+        числовые папки ("1", "2", ...) либо папки с произвольными именами;
+        служебные папки вида "mtpusr~", "work", "logs" отбрасываются по
+        признаку содержимого (в аккаунт-папке должен быть хотя бы файл
+        "map" или "key_datas").
+        """
+        found: list[str] = []
+        try:
+            entries = sorted(
+                os.listdir(container),
+                key=lambda n: (0, int(n)) if n.isdigit() else (1, n.lower()),
+            )
+        except OSError:
+            return found
+        for name in entries:
+            acc_dir = os.path.join(container, name)
+            if not os.path.isdir(acc_dir):
+                continue
+            has_map = os.path.isfile(os.path.join(acc_dir, "map"))
+            has_kds = os.path.isfile(os.path.join(acc_dir, "key_datas"))
+            # Папки без признаков аккаунта пропускаем (служебные)
+            if has_map or has_kds:
+                found.append(name)
+        return found
+
     def find_tdata_accounts(base_path: str) -> list[tuple[str, str]]:
         """
         Поиск аккаунтов tdata внутри указанного пути.
 
         Поддерживаемые структуры:
-        - AyuGram/iGram/Unigram-форки: <tdata>/<аккаунт>/key_datas —
-          каждый аккаунт лежит в отдельной ПОДПАПКЕ (их может быть много);
-        - официальный Telegram Desktop (в т.ч. portable): один файл
-          «key_data» в корне tdata, внутри которого может храниться
-          НЕСКОЛЬКО аккаунтов (подпапок нет).
+        - AyuGram/iGram/форки Unigram: общий файл «key_datas» В КОРНЕ tdata
+          + подпапки аккаунтов ("1", "2", "3", "4"); возвращаются все
+          аккаунты этого контейнера;
+        - старый формат форков: у каждого аккаунта свой «key_datas» внутри
+          своей подпапки;
+        - официальный / portable Telegram Desktop: файл «key_data» в корне
+          tdata (несколько аккаунтов внутри одного файла) — возвращается
+          одна запись на каждый аккаунт, если удалось прочитать заголовок.
 
         :param base_path: Путь к папке tdata ИЛИ к AppData-папке клиента.
-        :return: Список троек (отображаемое имя, путь к контейнеру tdata,
-                 тип контейнера: "folder" — подпапка аккаунта,
-                 "file" — единый key_data с несколькими аккаунтами).
+        :return: Список пар (отображаемое имя, путь к КОНТЕЙНЕРУ tdata).
+                 Выбор конкретного аккаунта выполняется GUI по имени метки
+                 («Аккаунт 3» -> индекс 3) при импорте.
         """
         base = os.path.abspath((base_path or "").strip().strip('"'))
         if not os.path.isdir(base):
             return []
 
-        def _has_key_datas(path: str) -> bool:
-            """Папка конкретного аккаунта форка (содержит key_datas)."""
-            return os.path.isfile(os.path.join(path, "key_datas"))
-
-        def _is_key_data_root(path: str) -> bool:
-            """Контейнер официального TD: файл key_data прямо в папке."""
-            return os.path.isfile(os.path.join(path, "key_data"))
-
-        def _scan_container(container: str) -> list[tuple[str, str, str]]:
-            """Перечисляет ВСЕ подпапки-аккаунты контейнера tdata.
-
-            ВАЖНО: AyuGram хранит подпапки аккаунтов с ЧИСЛОВЫМИ именами
-            ("1", "2", "3", "4"), а не с именами пользователей — имена из
-            listdir и есть отображаемые метки («Аккаунт 1» ... «Аккаунт 4»).
-            """
-            items: list[tuple[str, str, str]] = []
+        def _has_keys(path: str) -> bool:
+            """В папке есть любой файл ключей tdata?"""
             try:
-                names = sorted(
-                    os.listdir(container),
-                    key=lambda n: (0, int(n)) if n.isdigit() else (1, n.lower()),
-                )
+                names = [e.lower() for e in os.listdir(path)]
             except OSError:
-                return items
-            for name in names:
-                acc_dir = os.path.join(container, name)
-                if os.path.isdir(acc_dir) and _has_key_datas(acc_dir):
-                    label = f"Аккаунт {name}" if name.isdigit() else name
-                    items.append((label, acc_dir, "folder"))
-            return items
+                return False
+            return any(
+                n.startswith("key_data") or n == "data" for n in names
+            )
 
-        results: list[tuple[str, str, str]] = []
+        def _container_candidates(start: str) -> list[str]:
+            """Собираем возможные корни контейнеров tdata из выбранного пути."""
+            cands: list[str] = []
+            norm = os.path.normcase(start)
+            # a) сам путь — контейнер tdata (в нём есть key_data*)
+            if _has_keys(start):
+                cands.append(start)
+            # b) рядом лежит ./tdata (выбрана AppData-папка клиента)
+            tdata_child = os.path.join(start, "tdata")
+            if os.path.isdir(tdata_child) and _has_keys(tdata_child):
+                cands.append(tdata_child)
+            # c) рядом лежит ../tdata (выбрана подпапка внутри tdata или
+            #    профиль portable-клиента)
+            sibling = os.path.join(os.path.dirname(start), "tdata")
+            if os.path.normcase(sibling) != norm and os.path.isdir(sibling) and _has_keys(sibling):
+                cands.append(sibling)
+            # c2) поднятие на несколько уровней вверх: пользователь мог
+            #     выбрать .../tdata/<аккаунт>/logs и т.п. Ищем ближайшего
+            #     предка с именем tdata, содержащего файлы ключей.
+            if not cands:
+                parent = os.path.dirname(start)
+                for _ in range(4):
+                    if not parent or parent == os.path.dirname(parent):
+                        break
+                    if os.path.basename(parent).lower() == "tdata" and _has_keys(parent):
+                        cands.append(parent)
+                        break
+                    parent = os.path.dirname(parent)
+            # d) выбрана НЕ tdata, но внутри лежат подпапки с key_datas
+            #    (пользователь указал родитель типа .../AyuGramDesktop/tdata
+            #    уже обработан выше; этот случай — когда ключи глубже)
+            if not cands:
+                try:
+                    for name in os.listdir(start):
+                        sub = os.path.join(start, name)
+                        if os.path.isdir(sub) and _has_keys(sub):
+                            cands.append(sub)
+                except OSError:
+                    pass
+            # дедупликация
+            uniq: dict[str, str] = {}
+            for c in cands:
+                uniq[os.path.normcase(os.path.abspath(c))] = c
+            return list(uniq.values())
 
-        # Вариант 1: указан путь профиля portable-клиента (рядом лежит tdata)
-        if not _has_key_datas(base) and not _is_key_data_root(base):
-            sibling_tdata = os.path.join(os.path.dirname(base), "tdata")
-            if os.path.isdir(sibling_tdata):
-                base = sibling_tdata
+        results: list[tuple[str, str]] = []
 
-        # Вариант 2: base — корневая папка tdata форка: подпапки-аккаунты
-        sub_dirs = _scan_container(base)
-        if sub_dirs:
-            results.extend(sub_dirs)
+        for container in _container_candidates(base):
+            has_key_datas = os.path.isfile(os.path.join(container, "key_datas"))
+            has_key_data = os.path.isfile(os.path.join(container, "key_data"))
 
-        # Вариант 3: base — AppData-папка клиента (.../AyuGramDesktop)
-        if not results:
-            tdata_root = os.path.join(base, "tdata")
-            if os.path.isdir(tdata_root):
-                results.extend(_scan_container(tdata_root))
-                if _is_key_data_root(tdata_root):
-                    n = ClientManager._read_tdata_accounts_count(tdata_root, None)
-                    label = f"Telegram Desktop ({n} акк.)" if n > 1 else "Telegram Desktop"
-                    results.append((label, tdata_root, "file"))
+            # --- Форки Unigram (AyuGram/iGram): общий key_datas + подпапки ---
+            if has_key_datas:
+                sub_dirs = ClientManager._list_account_subdirs(container)
+                if sub_dirs:
+                    for name in sub_dirs:
+                        label = f"Аккаунт {name}" if name.isdigit() else name
+                        results.append((label, container))
+                else:
+                    # Подпапок нет — пробуем посчитать аккаунты внутри
+                    # общего key_datas; если не вышло — показываем один.
+                    n = ClientManager._read_tdata_accounts_count(
+                        container, None
+                    ) or 1
+                    for i in range(1, n + 1):
+                        results.append((f"Аккаунт {i}", container))
 
-        # Вариант 4: base сама является контейнером key_data (portable TD)
-        if not results and _is_key_data_root(base):
-            n = ClientManager._read_tdata_accounts_count(base, None)
-            label = f"{os.path.basename(base)} ({n} акк.)" if n > 1 else os.path.basename(base)
-            results.append((label, base, "file"))
+            # --- Официальный/portable TD: единый key_data со списком ---
+            if has_key_data:
+                try:
+                    n = ClientManager._read_tdata_accounts_count(container, None)
+                except Exception:  # noqa: BLE001 — сбой чтения не должен ломать скан
+                    n = 0
+                if n <= 0:
+                    n = 1
+                for i in range(1, n + 1):
+                    label = (
+                        f"Аккаунт {i}"
+                        if n > 1
+                        else f"Telegram Desktop ({os.path.basename(os.path.dirname(container))})"
+                    )
+                    results.append((label, container))
 
-        # Дедупликация по нормализованному пути
-        unique: dict[str, tuple[str, str, str]] = {}
-        for name, path, kind in results:
-            unique[os.path.normcase(os.path.abspath(path))] = (name, path, kind)
+        # Дедупликация по (метка, контейнер)
+        unique: dict[tuple[str, str], tuple[str, str]] = {}
+        for name, path in results:
+            unique[(name, os.path.normcase(os.path.abspath(path)))] = (
+                name,
+                path,
+            )
         return sorted(unique.values(), key=lambda item: item[0].lower())
 
     async def add_account_by_tdata(
@@ -884,36 +964,54 @@ class ClientManager:
             abs_path = os.path.dirname(abs_path)
 
         def _has_key_file(path: str) -> bool:
-            """Есть ли в папке файлы ключей tdata (key_data / key_datas / data)."""
+            """Есть ли в папке файлы ключей tdata (key_data / key_datas)."""
             try:
                 entries = os.listdir(path)
             except OSError:
                 return False
             names = [e.lower() for e in entries]
-            return any(
-                n.startswith("key_data") or n == "data" or n.startswith("key_")
-                for n in names
-            )
+            return any(n.startswith("key_data") for n in names)
 
-        # Если указана НЕ корневая папка tdata, но рядом лежит ../tdata с
-        # ключами — используем его (например, пользователь выбрал папку
-        # профиля portable-клиента вместо папки tdata внутри неё).
+        # Нормализация пути: если выбрана НЕ корневая папка tdata, ищем
+        # контейнер с ключами рядом/внутри (порядок как в find_tdata_accounts).
         if not _has_key_file(abs_path):
-            sibling_tdata = os.path.join(os.path.dirname(abs_path), "tdata")
-            if os.path.isdir(sibling_tdata) and _has_key_file(sibling_tdata):
-                abs_path = sibling_tdata
-
-        if not _has_key_file(abs_path):
-            # Возможно указан AppData-папка клиента — попробуем <base>/tdata
-            alt = os.path.join(abs_path, "tdata")
-            if os.path.isdir(alt) and _has_key_file(alt):
-                abs_path = alt
+            resolved: Optional[str] = None
+            # a) ./tdata (выбрана AppData-папка клиента .../AyuGramDesktop)
+            child = os.path.join(abs_path, "tdata")
+            if os.path.isdir(child) and _has_key_file(child):
+                resolved = child
             else:
-                raise ClientManagerError(
-                    f"В папке {abs_path} нет файлов ключей Telegram Desktop "
-                    "(key_data / data).\n\nУкажите корневую папку tdata "
-                    "(...\\AyuGramDesktop\\tdata), а не подпапку аккаунта."
-                )
+                # b) ../tdata (выбрана подпапка аккаунта или профиль portable)
+                sibling = os.path.join(os.path.dirname(abs_path), "tdata")
+                if os.path.normcase(sibling) != os.path.normcase(abs_path) \
+                        and os.path.isdir(sibling) and _has_key_file(sibling):
+                    resolved = sibling
+            if resolved is None:
+                # c) глубже: любая непосредственная подпапка с ключами
+                try:
+                    for name in sorted(os.listdir(abs_path)):
+                        sub = os.path.join(abs_path, name)
+                        if os.path.isdir(sub) and _has_key_file(sub):
+                            resolved = sub
+                            break
+                except OSError:
+                    pass
+            if resolved is not None:
+                abs_path = resolved
+
+        if not _has_key_file(abs_path):
+            raise ClientManagerError(
+                f"В выбранной папке нет файлов ключей Telegram Desktop.\n\n"
+                f"Проверенный путь:\n    {abs_path}\n\n"
+                "Ожидаемая структура — внутри папки tdata лежат файлы\n"
+                "  «key_datas» (AyuGram/iGram) или «key_data» (Telegram\n"
+                "Desktop/portable) и подпапки аккаунтов «1», «2», ...\n\n"
+                "Подсказки:\n"
+                "• AyuGram: C:\\Users\\<ник>\\AppData\\Roaming\\AyuGramDesktop\\tdata\n"
+                "• Portable: <папка_клиента>\\Telegram\\tdata\n"
+                "• Если в клиенте включён Local Passcode — введите пароль\n"
+                "  в поле «Пароль tdata»."
+            )
 
         def _status(text: str) -> None:
             """Безопасный вызов колбэка статуса."""
@@ -1210,12 +1308,12 @@ class ClientManager:
         target_name = account_name or sub_name
 
         last_err: Optional[str] = None
-        for key_file in ("key_data", "key_datas"):
+        for key_file in ("key_datas", "key_data"):
             full = os.path.join(root, key_file)
             if not os.path.isfile(full):
                 continue
             try:
-                desc = td.Storage.ReadFile(key_file.replace("key_", "key_"), root)
+                desc = td.Storage.ReadFile(key_file, root)
             except Exception as exc:  # noqa: BLE001
                 last_err = str(exc)
                 continue
